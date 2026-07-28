@@ -551,6 +551,22 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Where each guest thread's stack starts.
+    //
+    // Threads are separate instances over one shared memory and the stack
+    // pointer is a per-instance global, so equal values here mean they are all
+    // writing over the same region — which would explain a pointer into a
+    // caller's frame coming back cleared.
+    let stacks: Vec<String> = runtime
+        .logs()
+        .into_iter()
+        .filter(|line| line.contains("stack pointer"))
+        .collect();
+    println!("--- thread stacks ({} reported) ---", stacks.len());
+    for line in &stacks {
+        println!("  {}", line.trim());
+    }
+
     println!("--- low memory around 0x18 ---");
     if let Ok(b) = runtime.read(0, 64) {
         for (i, w) in b.chunks_exact(4).enumerate() {

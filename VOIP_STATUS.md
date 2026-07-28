@@ -256,8 +256,54 @@ Without the `+1`, run 2 reads as "already cleared" and the window closes on the
 wrong side. **The window is now between SSRC generation and
 `create_p2p_transport start`.**
 
-**Next:** probe the sites between those two — `Generated app_data_ssrc`, the
-peer's SSRC lines — each with its control and the `+1` encoding.
+### It is not one instruction — the clearing is non-deterministic
+
+Probing `"updating peer jid to"` (offset 4581479, inside
+`wa_call_group_create_participant`) three times, same binary, same point:
+
+| run | `*(36)` | reading |
+| --- | --- | --- |
+| 1 | `0x6b1109` | `array[0]` populated |
+| 2 | `0x6b1109` | populated |
+| 3 | **`0x1`** | **already cleared** |
+
+At a fixed point in the code the slot is sometimes alive and sometimes not. That
+rules out "find the store that writes zero" and reframes the whole thing: the
+array is a **stack temporary** — measured at `SP + 1552` when the offer fails —
+and the engine runs guest threads. **Its lifetime does not cover its use.**
+
+It also accounts for the run-to-run spread recorded above (24 versus ~200 log
+lines from the same unpatched module), and for why the group's participants are
+correct while the raw array is not: those were copied.
+
+### The leading hypothesis: guest threads share one stack
+
+Not how the list is passed — that was checked. `Runtime::build_vector` builds the
+`StringList` with the engine's own constructor and `push_back`, exactly as the JS
+glue does, so it is a guest-heap object. The array at `0x24bed0` is a stack copy
+`startVoipCall` makes for itself.
+
+The suspect is `crates/oracle-core/src/threads.rs`. Guest threads here are
+**separate module instances over one SharedMemory**, and `__stack_pointer` is a
+**per-instance** global. The code deliberately skips `establishStackSpace`, on
+the grounds that `_emscripten_thread_init` already gives the thread its stack in
+this build. **If that is not true**, every thread starts from the module's
+initial stack pointer and they all write over the same region.
+
+That would account for every symptom at once: a stack temporary zeroed
+non-deterministically at a fixed point, the 24-versus-200-line spread between
+runs of the same module, the traps inside `startVoipCall`, and workers dying on
+wild addresses.
+
+**Check it first, it is cheap:** read `__stack_pointer` from each thread's
+instance right after `_emscripten_thread_init` and compare. Equal values across
+threads proves it. `Runtime::global_i32` already exists.
+
+If it holds, the fix is ours: give each thread its own stack by allocating from
+the host and setting that instance's global directly. Note what the existing
+comment records — going through `establishStackSpace` with the pthread struct's
+`+52/+56` made things much worse — but the reason given is that those offsets do
+not hold for this module. The approach was right and the offsets were wrong.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at

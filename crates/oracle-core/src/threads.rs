@@ -198,6 +198,26 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
             .context("__emscripten_thread_init")?;
     }
 
+    // Where this thread's stack actually is.
+    //
+    // Threads are separate instances over one shared memory, and the stack
+    // pointer is a *per-instance* global — so unless something moves it, every
+    // thread starts from the module's initial value and they all write over the
+    // same region. That is invisible until a long-lived pointer into a caller's
+    // frame comes back wrong, which is exactly the shape of the bug being
+    // chased in VOIP_STATUS.md. Report it rather than assume `thread_init` did
+    // the right thing.
+    // This module exports its globals positionally — `__global_0` upward — and
+    // global 0 is the stack pointer.
+    if let Some(Extern::Global(sp)) = instance.get_export(&mut store, "__global_0")
+        && let Val::I32(value) = sp.get(&mut store)
+    {
+        ctx.shared.log(
+            ctx.id,
+            format!("thread {} stack pointer {value:#x}", ctx.id),
+        );
+    }
+
     // TLS as well as the pthread, not instead of it. It was an `else if`, so a
     // module that has both got only the first — and thread-local storage left
     // uninitialised reads as a wild pointer later, which is what the
