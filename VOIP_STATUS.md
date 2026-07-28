@@ -331,13 +331,30 @@ And it breaks the run: four attempts, all 24 log lines and 11-12 traps, the
 dead-run signature. Tried both before and after `__emscripten_thread_init`, with
 no difference, so it is not an ordering problem. Reverted.
 
-The likely reason is that the stack bounds live in the pthread struct and in
-emscripten's own accounting as well as in the global, and moving one of the
-three desynchronises them — the guest's stack checks keep seeing the old
-bounds. A correct fix has to update the struct too, which is what
-`establishStackSpace` does, and whose `+52/+56` offsets were already measured as
-wrong for this module. **Finding this build's real pthread stack offsets is the
-next step.**
+Going through emscripten's own entry points does not help either. This module
+exports `emscripten_stack_set_limits`, `stackRestore`, `stackSave`,
+`emscripten_stack_get_base/end/current/free` and `emscripten_stack_init`, so the
+bounds can be set without touching the pthread struct at all — and calling
+`set_limits(top, base)` followed by `stackRestore(top)` fails exactly the same
+way. Four variants were tried: writing global 0 or going through those exports,
+each before and after `__emscripten_thread_init`. All four give 24 lines and
+11-12 traps.
+
+**What isolates the mistake:** running the allocation *without* moving the stack
+gives 202 lines, 2 × 70008 and zero traps across three runs. So `malloc` on a
+thread's instance is harmless; **the relocation is what breaks it**.
+
+Which says the approach was wrong rather than the mechanics. In emscripten's
+model the guest's own `pthread_create` has already allocated this thread's
+stack and recorded it in the pthread struct — that is why `establishStackSpace`
+*reads* it rather than allocating. A freshly malloc'd region is a second stack
+the guest knows nothing about, while its TLS and canaries still refer to the
+first.
+
+**Next:** decompile `_emscripten_thread_init` — exported, six parameters, the
+first being the pthread pointer — and read which offsets of that argument it
+takes the stack from. Then hand those to `emscripten_stack_set_limits` and
+`stackRestore`, instead of `+52/+56`, which are already known not to hold here.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
