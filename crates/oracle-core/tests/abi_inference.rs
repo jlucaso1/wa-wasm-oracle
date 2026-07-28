@@ -298,6 +298,44 @@ fn passive_segments_are_placed_where_memory_init_puts_them() {
     );
 }
 
+/// Naming a function means reading the constants its logging call is handed,
+/// and that only works if an address resolves through the passive segments.
+///
+/// Deriving the mapping by hand — segment base plus offset, straight off the
+/// data section — silently skips the `memory.init` placement above and returns
+/// text from the wrong address: not an error, just a plausible-looking string
+/// that belongs to some other file. Tracking down a `70008` cost a detour that
+/// way, so the module's own reader is the only thing that should do this.
+#[test]
+fn an_address_resolves_to_the_text_the_module_actually_places_there() {
+    let bytes = module_or_skip!("D5pLH9sfOOl");
+
+    let found = abi::find_string_refs(&bytes, "record_incoming_msg: no active call").expect("scan");
+    let entry = found.first().expect("the message should be in the module");
+
+    let text = abi::static_string(&bytes, entry.address)
+        .expect("resolve")
+        .expect("the address the scan reported must hold text");
+
+    assert!(
+        text.starts_with("record_incoming_msg: no active call"),
+        "resolving the scan's own address should return the scan's own string, got {text:?}"
+    );
+
+    // One byte in is still inside the string, and must not fall back to some
+    // other segment — the failure mode being pinned is a plausible wrong answer,
+    // not an empty one.
+    let shifted = abi::static_string(&bytes, entry.address + 1)
+        .expect("resolve")
+        .expect("one byte into a string is still text");
+    assert!(
+        text.ends_with(&shifted),
+        "reading from {} should be the tail of reading from {}, got {shifted:?}",
+        entry.address + 1,
+        entry.address
+    );
+}
+
 /// Some strings are reached only through a table of pointers.
 ///
 /// An enum's names are indexed, never named, so no instruction mentions them.

@@ -551,6 +551,19 @@ fn static_text(data: &[(u32, Vec<u8>)], addr: u32) -> Option<String> {
     (text.len() >= MIN_RUN).then_some(text)
 }
 
+/// The text at a static address, for naming what a call site is handed.
+///
+/// A minified module still keeps its `__FILE__` strings and function names in
+/// data segments, and a logging call is passed both as plain constants. That
+/// makes this the shortest route from a bare function index to the C++ name it
+/// was compiled from — reading the constants pushed before its `call` to the
+/// logger. Resolving those by hand means re-deriving segment bases and getting
+/// them subtly wrong; this reuses the module's own reader instead.
+pub fn static_string(bytes: &[u8], addr: u32) -> Result<Option<String>> {
+    let module = Layout::read(bytes)?;
+    Ok(static_text(&module.data, addr))
+}
+
 fn scan_body(
     name: &str,
     index: u32,

@@ -21,127 +21,137 @@ because nothing was ever constructed to send. Any account of this that starts
 from "the outbound channel is blocked" is wrong — that reading survived a long
 time and cost accordingly.
 
-`make_and_cache_offer` is function 11198 (`offer.cc`), and it returns 70008
-from **nine** different places — at `offer.cc` lines 296, 430, 463, 485, 767,
-776, 784 and 789. Guessing which one fires wasted a lot of time; two of them
-were patched open with no effect at all.
+### Finding the site that actually fires
 
-Making the engine say it takes one trick. Every site pushes the same
-`i32.const 70008`, four bytes, and neighbouring values encode to the same
-length — so a copy of the module can give each site a distinct code without
-moving anything:
+`i32.const 70008` occurs **481 times** in the module — it is a data constant as
+well as an error code, so any account built on a hand-counted subset is
+guessing. (An earlier draft of this file said "nine sites at lines 296, 430,
+463…". That was wrong, and chasing line 430 in particular cost several rounds.)
+
+Every site pushes the same four bytes, and neighbouring values encode to the
+same 3-byte sleb — so a copy of the module can give **all 481** a distinct code
+without moving anything:
 
 ```sh
-# each i32.const 70008 in the function's range -> 70101, 70102, ...
-# then read which one comes back in
+# site i -> i32.const (200000 + i), then read back which one the engine reports in
 #   "wa_call_start_internal, make_and_cache_offer failed: %d"
 ```
 
-The answer is **70112**, which is **`offer.cc:485`**:
+Exactly one comes back: **200391**, which is function **11198**, and the
+bytecode there carries the line number as a literal:
 
 ```
-if (10530(ctx, 10297(arg1->[0])) == 0)  ->  70008
-
-  10297  wa_call_participant_jid_get_user_jid   (common/wa_call_participant_jid.cc)
-  10530  calls 10535(ctx, jid); null -> 0, else reads [+8]
-  10535  loads ctx->[659164] — the group — and searches it by JID
+call 10297 ; local.tee 15
+call 10530 ; local.tee 21
+i32.eqz ; if
+  i32.const 0 ; i32.const <file> ; i32.const <func> ; i32.const 485   <- offer.cc:485
+  call 8502                                                          <- log
+  i32.const 70008
 ```
 
-**Looking a participant up by JID inside the group returns nothing.** It is
-about participants after all, but about a *lookup*, not about the cached self
-pointer that `offer.cc:463` guards.
+### The failure, measured end to end
 
-What makes that odd is that the participants are there: `getCallInfo` lists two,
-one marked `is_self` with our own LID and one for the peer. And the peer JID's
-shape is not the variable — five forms (bare LID, device LID, legacy `@c.us` in
-the fifth argument, self added to the list, bare list) all fail at the same
-site.
-
-### The conversion that one side gets and the other does not
-
-The engine has a device-to-user conversion, `wa_call_user_jid_create_from_device_jid`
-(function 10274, `common/wa_call_jid.cc`). Counting calls to it settles the
-asymmetry:
-
-| | calls 10274 |
-| --- | --- |
-| `wa_call_group_create_participant` — builds the participants | **twice** |
-| `create_participant_jid` — builds the lookup key | **never** |
-
-Participants are converted and stored in user form; the key is not converted and
-stays in device form. That is why `pj_strcmp` at `offer.cc:485` compares twenty
-characters against eighteen.
-
-The key's chain is `startVoipCall → create_participant_jid →
-voipBridgeJidToVoipJID → wa_call_participant_jid_create_with_params`, and the
-last of those copies the JID without normalising it. Note that
-`wa_call_participant_jid_get_user_jid` (10297) does not convert anything despite
-its name — it is a single load.
-
-There is no second index to fall back on: `get_participant` and
-`wa_call_group_get_participant_by_jid` both compare only the user field. The
-sync routine that would canonicalise everything runs after a server offer or
-ack, which is later than the point an outgoing call fails.
-
-Passing the peer list in user form does not help — measured over three healthy
-runs — so the device form is derived internally rather than copied from what the
-host passes.
-
-What is *not* measured: the key's own form. `ctx[1288]` (device) and the
-participants (user) were read out of memory; the key itself never was. The chain
-above is disassembly, so treat "the key is device-form" as well-supported
-inference, not as a reading. Closing that needs instrumentation at 10293 or
-10297.
-
-### Why the comparison fails, and the proof
-
-The two sides carry JIDs in different shapes. Read out of memory:
+The lookup is not the problem. **The key handed to it is null**, so nothing is
+ever compared:
 
 ```
-the self jid (ctx[1288], used to create)   a participant's jid (p->[4], in the group)
-  +8   len 20  "99887766554433:0@lid"        +8   len 18  "99887766554433@lid"
-  +24  len 16  "99887766554433:0"            +24  len 14  "99887766554433"
-  +48  len 14  "99887766554433"              +40  domain 5
-  +72  len 20  "99887766554433:0@lid"
+10534  make_and_cache_offer   (reads the ctx from *(u32*)1352840; has its own 70008 site)
+  |
+  +- 11198(param0 = ctx, param1 = local2 + 80, ..., param9 = out-param)   [10 params]
+       *(local2 + 80) == NULL                         <- measured
+       |
+       +- 10297(x) = (x == NULL ? log(line 158), NULL : x->[0])   [32 bytes]
+            |
+            +- key NULL -> 10530(ctx, NULL) -> 10535 returns before its loop
+                        -> 0 -> offer.cc:485 -> 70008
 ```
 
-One is a *device* jid, the other a *user* jid, and `pj_strcmp` is applied to `+8`
-of each — 20 characters against 18. It cannot match. Both hold the same number,
-but at different offsets.
-
-That is testable without finding the search key at all: patch the comparison to
-use the number instead of the raw form. In function 10284,
+`local2` is `SP - 416`, a stack frame inside 10534, and `local2 + 80` is an
+**array of 64 pointers** — `memory.fill(local2+80, 0, 256)` zeroes it on entry.
+There is no `i32.store offset=80` anywhere in the function; the one write uses a
+computed address, and it is **conditional**:
 
 ```
-local.get 0 ; i32.const 8 ; i32.add ; local.get 1 ; i32.const 8 ; i32.add ; call 8468
-                       ^^ -> 48                                ^^ -> 24
+local4 = call 10532(group, local8, jid = *(local2+408), 2, 1, ctx->group)
+if (local4 == 0) -> skip                     <- this is what happens
+*(local4 + 80) = 1
+*(local2 + 80 + local6*4) = *(local2 + 408)  <- the array write, never reached
+local6++
 ```
 
-`41 08` → `41 30` and `41 18`, same width, nothing moves. The pattern occurs
-twice; the one inside 10284 is the later offset.
+**So `10532` returns NULL, the participant never enters the array, element 0
+stays at the fill value, and the offer fails four frames later.** 10532 is 2226
+bytes, calls `10274` (`wa_call_user_jid_create_from_device_jid`) twice and the
+JID comparator `10284` twice, and — importantly — **returns without logging**:
+no new engine-log line appears between the transport lines and the 70008. That
+is where the remaining work is.
 
-With that patch **the 70008 disappears entirely** and the call runs for minutes
-instead of seconds before hanging — it is doing transport work it never reached
-before. So the device/user divergence is the first blocker, demonstrated rather
-than argued.
+`oracle abi <module> --index <n>` names these, by resolving the constants each
+one hands its logger:
 
-It is not a usable fix: it edits the module. The real fix is either to hand the
-engine JIDs in the shape it expects, or to find the setup step that converts
-device to user and never runs here. And signaling still does not go out — the
-probe reports `SIGNALING SENT: 0` with and without the patch, so more blockers
-follow.
+| index | name | file |
+| --- | --- | --- |
+| 11198 | `make_and_cache_offer` | `xplat/wa-voip/wacall/system/src/messages/senders/offer.cc` |
+| 10534 | `wa_call_invite` | `xplat/wa-voip/wacall/system/src/core/call_membership.cc` |
 
-The argument chain, counted instruction by instruction:
+The same command reports 10532's entry guard, which is the current frontier:
 
-* `make_and_cache_offer`'s `arg1` is `wa_call_start_internal`'s `arg3`.
-* `wa_call_start_call` calls it with `arg0 = *(u32*)1352840` — the context, from
-  a global — and `arg3 = params->[0]`, where `params` is `wa_call_start_call`'s
-  own first argument.
-* So the JID being looked for is `params->[0]->[0]`.
+```
+(arg0 != 0 && arg5 != 0)  AND  ( ((1 << arg3) & 5233) == 0 || arg3 > 12 )
+```
 
-Note that `params` is **not** the call context, which is easy to get wrong: the
-context arrives from the global, and the byte fields `[3856]`, `[3859]`,
-`[3860]` belong to `params`.
+`5233` is a validity mask over an enum of 0..12 — bits {0, 4, 5, 6, 10, 12} —
+and it is the same constant `10530` applies to a participant's `+8` field.
+`wa_call_invite` passes the literals `2` and `1` in that region of the argument
+list, and neither is in the mask. Treat that as a lead, not a finding: which
+literal lands on `arg3` is read off the caller's pushes, and the cheap way to
+settle it is to instrument 10532's entry and read `arg3` directly.
+
+### What this replaces
+
+The device-vs-user JID story that used to fill this section is **dead**. The
+comparison it blamed never executes. Two things kept it alive longer than they
+should have:
+
+* `10284` is a *generic* JID comparator with **57 call sites**. Instrumenting it
+  measures whichever call happened last, not the one on the offer path.
+* The claim "patching 10284's offsets makes the 70008 disappear" cannot be
+  reconciled with the loop never running. Unhealthy runs also produce *no*
+  70008, and that failure mode had already burned us once. Re-verify anything
+  resting on it against the health marker before reusing it.
+
+### Instrumentation that works
+
+Reading a guest value at a chosen point, length-preserving:
+
+* Replace the call/compare with `i32.const <ADDR> ; local.get N ; i32.store ;
+  i32.const 1 ; nop...`.
+* **Address choice is the whole trick.** `0x900000` lands in the live heap and
+  is overwritten; `0xF00000` and above make the store *trap* because memory has
+  not grown that far, which kills the run early and looks like "never
+  executed". **36** works — low static area, writable, survives.
+* Encode `value + 1` when zero is a meaningful answer, so "stored 0" and "never
+  stored" stay distinguishable. Otherwise pair every measurement with a control
+  variant that stores a constant.
+* To free bytes for a store, swap `if` (`04 40`) for `block` (`02 40`) — same
+  two bytes, and the condition's bytes become yours.
+
+Applied to 10535, with control:
+
+| variant | `*(36)` | reading |
+| --- | --- | --- |
+| control, stores -1 | `0xffffffff` | the site does execute |
+| `arg0` | `0x6d0018` | the context, non-null — matches `*(u32*)1352840` |
+| `arg1` | 0 | the key is null |
+
+Two decoding traps worth remembering: the guard in 10535 is `eqz ; eqz ; or ;
+eqz ; if` — there is an **extra `45`**, so it reads "both non-null", and reading
+the polarity backwards sends you to the wrong branch. And engine log lines
+**do not print the line number** they are given, so the absence of a particular
+line in the log proves nothing.
+
+Signatures on the path: `11198` 10 params / 1 result · `10534` 1/1 · `10530` 2/1
+· `10535` 2/1 · `10297` 1/1.
 
 ### Reading the call context
 
