@@ -47,6 +47,20 @@ const CALL_ID: &str = "0011223344556677";
 fn engine(bytes: &[u8]) -> anyhow::Result<Runtime> {
     let mut runtime = Runtime::instantiate(bytes)?;
     runtime.set_thread_policy(ThreadPolicy::Spawn);
+    // Register as emscripten's main runtime thread, the way the browser does.
+    //
+    // This was off because turning it on was measured breaking startup — but
+    // that predates passing `can_block = 0`, which is the value WhatsApp Web
+    // itself uses off the main browser thread. Sigilo, which runs WA's own JS
+    // glue under Bun, documents why: with `can_block = 1` the compiled futex
+    // reaches `memory.atomic.wait32`, and outside a browser that blocks forever
+    // instead of throwing.
+    //
+    // With it on the run is *deterministic* — 167 engine-log lines every time,
+    // against a baseline that wandered between 24 and 202 — and the proxy queue
+    // has a thread that may drain it, which is where the engine dispatches
+    // outgoing signaling. The offer still fails; this is not that fix.
+    runtime.set_main_thread_registration(true);
     runtime.run_ctors()?;
     runtime.attach_log_ring(4 << 20)?;
 

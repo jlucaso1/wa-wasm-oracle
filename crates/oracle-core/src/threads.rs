@@ -162,6 +162,39 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
         .instantiate(&mut store, &ctx.module)
         .context("instantiating module for thread")?;
 
+    // Wait for the creating thread to finish filling in this pthread.
+    //
+    // `+52` and `+56` — the stack this thread was given — read as zero at the top
+    // of the thread and hold values later, and nothing in
+    // `__emscripten_thread_init` writes them. So the guest's own `pthread_create`
+    // fills them on the creating thread while this one is already running, and
+    // anything read before that is a half-built structure.
+    {
+        const SPINS: usize = 2000;
+        for _ in 0..SPINS {
+            let ready = store
+                .data()
+                .memory
+                .as_ref()
+                .and_then(|memory| {
+                    let data = memory.data();
+                    let at = thread_ptr as usize + 52;
+                    let bytes = data.get(at..at + 4)?;
+                    // SAFETY: a read of bytes another thread is writing, which is
+                    // the point — shared memory is racy by design and this is
+                    // watching for the write to land.
+                    #[allow(unsafe_code)]
+                    let word: Vec<u8> = bytes.iter().map(|cell| unsafe { *cell.get() }).collect();
+                    Some(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                })
+                .is_some_and(|top| top != 0);
+            if ready {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+
     // Bind the guest's thread-local storage to this instance before running
     // anything: emscripten's runtime reads the pthread pointer from TLS, and a
     // routine that starts without it corrupts unrelated state rather than
