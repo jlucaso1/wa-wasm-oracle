@@ -395,6 +395,12 @@ running thread. It is not. The module's 228 imports are 227 functions and one
 memory; all fifteen globals are defined in the module, so they are genuinely
 per-instance.
 
+Its sibling is eliminated too: that `emscripten_stack_set_limits` keeps the
+bounds in linear memory, which *is* shared, so setting them from any thread
+would clobber every other thread's. It does not — the whole function is
+`g8 = base; g7 = end`, two more per-instance globals. So a worker setting its own
+limits cannot be reaching the main thread that way.
+
 With the allocation but no relocation: 202 lines, zero traps, three runs. So the
 relocation is what breaks it, whichever stack it installs.
 
