@@ -396,9 +396,16 @@ not the bounds, not the ordering, and not TLS at the top of the stack — a
 worker's stack pointer simply cannot leave the module's initial value without
 the thread dying. Ten variants say so.
 
+Aliasing is ruled out too, by the cleanest region available: growing the shared
+memory and using pages nothing has ever touched, which have no other claimant at
+all. Same failure. So it is not what lives at the address — **the value itself
+cannot change**.
+
 That is the question to answer before anything else here: **why must a worker's
-stack pointer keep its initial value?** Something the workers depend on is
-evidently tied to it, and nothing measured so far says what.
+stack pointer keep its initial value?** Eleven variants say it must, something
+the workers depend on is evidently tied to it, and nothing measured so far says
+what. A reasonable next suspicion is that these workers are not really executing
+against their own instance's globals the way this harness assumes.
 
 **The earlier discriminator, still worth keeping.**
 Running `emscripten_stack_init` on a worker's instance and then
