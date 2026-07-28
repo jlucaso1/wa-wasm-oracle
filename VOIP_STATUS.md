@@ -379,6 +379,14 @@ Establishing the stack is the host's job, and this host does not do it.
 5. `set_limits` + `stackRestore` with **the guest's own stack from +52/+56**
 6. the same, plus passing the real size (`0x10000`, from `+56`) as thread init's
    fifth argument instead of zero
+7. the mirror image — moving the **main thread** to a private 4 MiB region right
+   after `run_ctors`, while its stack is still shallow. The move itself succeeds
+   (`Ok((0x64ecf0, 0xa4ecf0))`) and the run dies the same way
+
+So it is not *which* stack. Relocating either side breaks this harness, which
+means something in how the module is driven is incompatible with moving the
+stack pointer after instantiation. Do not spend more attempts on that direction
+without a new hypothesis.
 
 With the allocation but no relocation: 202 lines, zero traps, three runs. So the
 relocation is what breaks it, whichever stack it installs.
