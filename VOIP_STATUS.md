@@ -377,15 +377,32 @@ Establishing the stack is the host's job, and this host does not do it.
 3. `emscripten_stack_set_limits` + `stackRestore` with a malloc'd stack, before
 4. the same, after
 5. `set_limits` + `stackRestore` with **the guest's own stack from +52/+56**
+6. the same, plus passing the real size (`0x10000`, from `+56`) as thread init's
+   fifth argument instead of zero
 
 With the allocation but no relocation: 202 lines, zero traps, three runs. So the
 relocation is what breaks it, whichever stack it installs.
 
-Something else here depends on threads sharing that region, or on when the
-switch happens — the entry point runs on the new stack while earlier state was
-built on the old. **Do not re-run those five.** Diff a 24-line log against a
-healthy one to find where it dies, and look at `emscripten_stack_init`, also
-exported, which may need calling on the thread's instance.
+**Do not re-run those five.** Diffing a 24-line log against a healthy one says
+where it goes: the run dies **inside `initVoipStack`**, not on the call path. Its
+last lines are media init —
+
+```
+wa_media_api.  init_audio_codecs = 0
+wa_media_api.  init_media_endpt_and_codecs Exit
+```
+
+— so the switch kills the workers started during initialisation, long before an
+offer is built. That is where to look.
+
+One concrete lead. `_emscripten_thread_init` stores its fifth argument at
+1268876 when both that and its third are non-zero, which makes it the default
+stack size. This host calls it with `(thread_ptr, 0, 0, 1, 0, 0)`: both are zero,
+so the global is never written. Emscripten's signature is `(pthread_ptr,
+isMainBrowserThread, isMainRuntimeThread, canBlock, defaultStackSize,
+startProfiling)`, so passing the real size — `0x10000`, from `+56` — and possibly
+a non-zero third argument is worth measuring. `emscripten_stack_init` is exported
+too, and may need calling on the thread's instance.
 
 Exports worth knowing: `emscripten_stack_set_limits`, `..._get_base`,
 `..._get_end`, `..._get_current`, `..._get_free`, `emscripten_stack_init`,
