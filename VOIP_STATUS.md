@@ -167,8 +167,31 @@ region, so this is not a use-after-free of popped stack. Something writes over
 that slot in between. (The `l27 = SP - 16` in `10425`'s LID-consistency loop is a
 temporary copy of the `{ptr, count}` pair, not the array; ruled out.)
 
-**Next:** find what writes `0x24bed0` between `wa_call_start_call`'s entry and
-the offer.
+Reading the same slot at three points narrows the window to one function:
+
+| where | `array[0]` |
+| --- | --- |
+| `wa_call_start_call` entry | `0x6b1108` |
+| `wa_call_start_internal` entry | `0x6b1108` |
+| `make_and_cache_offer`, at the failure | **0** |
+
+**So it is cleared inside `wa_call_start_internal`.** Instrumenting that entry
+uses the same shape: the `call_lifecycle.cc:695` assert has a dead 16-byte body
+at file offset 4505540, preceded by `45 04 40`; turning that into `1a 02 40`
+(`drop; block`) makes the body run unconditionally, and the body becomes the
+store. Check the sleb encoding against the bytecode first — `775533` is
+`ed aa 2f`, and assuming `ad aa 2f` finds nothing.
+
+The frame arithmetic says where to look. `11198` allocates 384 bytes and `10425`
+allocates 1168; the stack pointer at the failure is `0x24b8c0`, and
+`0x24b8c0 + 1552` is exactly the array's address. The array sits immediately
+above `10425`'s frame, at `frame + 1168` — so anything writing at or past that
+offset lands on it. Direct stores do not: the largest offset `10425` writes is
+1164. That leaves writes through computed pointers, or a callee writing past its
+own frame.
+
+**Next:** bisect within `10425` — it has several dead assert bodies to hijack —
+and check its `memory.copy`/`memory.fill` sites.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
