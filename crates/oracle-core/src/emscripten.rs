@@ -500,6 +500,22 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
                     .data()
                     .log(format!("__emscripten_init_main_thread_js: {error}"));
             }
+
+            // Then thread-local storage, which the main thread needs as much as
+            // a worker does. WhatsApp Web's own sequence is `_emscripten_thread_init`,
+            // `_emscripten_tls_init`, `__wasm_call_ctors`,
+            // `_embind_initialize_bindings`; only the first was being done here,
+            // and a main thread with uninitialised TLS reads a wild pointer the
+            // moment anything looks one up.
+            if let Some(wasmtime::Extern::Func(tls)) = caller.get_export("_emscripten_tls_init") {
+                let results = tls.ty(&caller).results().len();
+                let mut out = vec![Val::I32(0); results];
+                if let Err(error) = tls.call(&mut caller, &[], &mut out) {
+                    caller
+                        .data()
+                        .log(format!("_emscripten_tls_init (main): {error}"));
+                }
+            }
         },
     )?;
 
