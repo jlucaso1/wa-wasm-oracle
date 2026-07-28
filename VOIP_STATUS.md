@@ -388,7 +388,19 @@ means something in how the module is driven is incompatible with moving the
 stack pointer after instantiation. Do not spend more attempts on that direction
 without a new hypothesis.
 
-**The sharpest statement of the blocker, from a discriminator worth keeping.**
+**The sharpest statement, and it is a strange one.** `stackRestore` is three
+instructions — `local.get 0; global.set 0`, nothing else. Calling it with the
+value already in the global is **healthy**: 202 lines, no traps, three runs.
+Calling it with any other value is fatal. So it is not the call, not the region,
+not the bounds, not the ordering, and not TLS at the top of the stack — a
+worker's stack pointer simply cannot leave the module's initial value without
+the thread dying. Ten variants say so.
+
+That is the question to answer before anything else here: **why must a worker's
+stack pointer keep its initial value?** Something the workers depend on is
+evidently tied to it, and nothing measured so far says what.
+
+**The earlier discriminator, still worth keeping.**
 Running `emscripten_stack_init` on a worker's instance and then
 `emscripten_stack_set_limits(top, end)` with the pthread's own `+52/+56`, but
 *not* `stackRestore`, gives **202 lines and 0-2 traps** — healthy. Adding the
