@@ -559,10 +559,16 @@ than guessed:
   to put a second instance over shared memory — and this engine needs workers to
   initialise.
 
-So the first thing to test is cheap and settles it: whether the engine reaches
-`startVoipCall` with no real threads at all, say with `__pthread_create_js`
-reporting success and doing nothing. **If it does and the offer then succeeds,
-that alone proves the diagnosis** — the watchpoint becomes unnecessary.
+That first question is cheap to answer here, and the answer closes the route:
+running this harness with `ThreadPolicy::PretendSuccess` — `pthread_create`
+reporting success and starting nothing — gives **zero engine-log lines and a
+trap, three times**. The engine does not initialise without real workers, so a
+single-instance decompilation cannot reach `startVoipCall` either.
+
+**The watchpoint needs a threading model to be usable on this module**: shared
+memory with a second instance over it, which is what this repository's
+`threads.rs` does and what the generated code has no shape for. That is the ask
+if this route is worth opening.
 
 ## Read the module as source before disassembling anything
 
