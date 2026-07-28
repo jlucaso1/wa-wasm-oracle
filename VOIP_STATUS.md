@@ -539,6 +539,31 @@ Three things worth knowing before trusting a run:
   outgoing call it sometimes fills with random printable bytes instead of
   messages, which reads as "the call went quiet" when it means the opposite.
 
+## What the watchpoint route would cost
+
+`unwasm --instrument-stores` plus `memory.watch(addr, len)` answers "who wrote
+this address" with a backtrace instead of a day of bisection, and it covers
+`fill`/`copy`, which matters because `memset` is the usual answer to "who zeroed
+it". That is the right tool for the cleared slot. The cost was measured rather
+than guessed:
+
+* `unwasm host` on this module emits **102 methods, 51 still to implement**:
+  filesystem syscalls, the thread glue (`_emscripten_thread_mailbox_await`,
+  `_emscripten_notify_mailbox_postmessage`, `emscripten_receive_on_main_thread_js`,
+  `_emscripten_thread_set_strongref`), `emscripten_asm_const_int/double` — embedded
+  JavaScript, deliberately left as `todo!()` — `_embind_register_class_constructor`,
+  and this engine's own callbacks. This repository already implements all of
+  them, so it is translation rather than invention.
+* **The blocker is threads.** The decompiled Rust holds memory as a `Vec<u8>` in
+  one instance and has no threading model, so `__pthread_create_js` has nowhere
+  to put a second instance over shared memory — and this engine needs workers to
+  initialise.
+
+So the first thing to test is cheap and settles it: whether the engine reaches
+`startVoipCall` with no real threads at all, say with `__pthread_create_js`
+reporting success and doing nothing. **If it does and the offer then succeeds,
+that alone proves the diagnosis** — the watchpoint becomes unnecessary.
+
 ## Read the module as source before disassembling anything
 
 `unwasm` (`~/projects/unwasm`) decompiles this module into Rust:
