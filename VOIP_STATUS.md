@@ -295,15 +295,49 @@ non-deterministically at a fixed point, the 24-versus-200-line spread between
 runs of the same module, the traps inside `startVoipCall`, and workers dying on
 wild addresses.
 
-**Check it first, it is cheap:** read `__stack_pointer` from each thread's
-instance right after `_emscripten_thread_init` and compare. Equal values across
-threads proves it. `Runtime::global_i32` already exists.
+### Confirmed: every guest thread starts on the same stack
 
-If it holds, the fix is ours: give each thread its own stack by allocating from
-the host and setting that instance's global directly. Note what the existing
-comment records — going through `establishStackSpace` with the pthread struct's
-`+52/+56` made things much worse — but the reason given is that those offsets do
-not hold for this module. The approach was right and the offsets were wrong.
+```
+thread 1 stack pointer 0x24cf60
+thread 2 stack pointer 0x24cf60
+thread 3 stack pointer 0x24cf60
+thread 4 stack pointer 0x24cf60
+thread 5 stack pointer 0x24cf60
+```
+
+`0x24cf60` is the module's initial value, which is also the main thread's.
+`_emscripten_thread_init` does not relocate it in this build, whatever its
+documentation says — and the comment in `threads.rs` asserting that it does is
+load-bearing, since it is the reason nothing sets one.
+
+The participant array sits at `0x24bed0`, 4240 bytes below that shared top.
+
+Reading it needs the right export name: this module exports globals
+positionally, `__global_0` upward, with no `__stack_pointer`. Global 0 is the
+stack pointer.
+
+### The obvious fix does not work
+
+Allocating 512 KiB per thread with the guest's own `malloc` and writing global 0
+does give each thread a distinct region, far from the main thread's:
+
+```
+thread 1 stack 0x849088..0x8c9080     thread 4 stack 0xfa46b0..0x10246b0
+thread 2 stack 0x940030..0x9c0030     thread 5 stack 0x10246b8..0x10a46b0
+thread 3 stack 0x9c0038..0xa40030
+```
+
+And it breaks the run: four attempts, all 24 log lines and 11-12 traps, the
+dead-run signature. Tried both before and after `__emscripten_thread_init`, with
+no difference, so it is not an ordering problem. Reverted.
+
+The likely reason is that the stack bounds live in the pthread struct and in
+emscripten's own accounting as well as in the global, and moving one of the
+three desynchronises them — the guest's stack checks keep seeing the old
+bounds. A correct fix has to update the struct too, which is what
+`establishStackSpace` does, and whose `+52/+56` offsets were already measured as
+wrong for this module. **Finding this build's real pthread stack offsets is the
+next step.**
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
