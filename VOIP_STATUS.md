@@ -190,8 +190,24 @@ offset lands on it. Direct stores do not: the largest offset `10425` writes is
 1164. That leaves writes through computed pointers, or a callee writing past its
 own frame.
 
-**Next:** bisect within `10425` — it has several dead assert bodies to hijack —
-and check its `memory.copy`/`memory.fill` sites.
+A fourth reading closes the window further. `make_and_cache_offer`'s own entry
+already sees the slot at zero — measured with a control at the same site that
+stores `-1` and does fire, and with `l1` reading `0x24bed0` as expected. So the
+clearing happens inside `wa_call_start_internal`, **before** it calls the offer.
+
+That entry is instrumentable the same way: the `offer.cc:409` assert (file offset
+5095354, unique) is preceded by a `0d 01` at `at-3`; turning it into `1a 01`
+(`drop; nop`) makes the body run every time. The function then returns 70004,
+which does not matter — the store has already happened.
+
+Two candidates are already ruled out. `memory.fill(l5+208, 0, 400)` in `10425`
+has `l5 = SP - 640`, a fresh allocation below the stack pointer, so it writes
+entirely below the array. And no direct `store(frame, N)` goes past 1164 against
+a 1168-byte frame.
+
+**Next:** the remaining suspects inside `10425` are writes through computed
+pointers, and callees writing past their own frames. It has several dead assert
+bodies left to hijack for further bisection.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
