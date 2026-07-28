@@ -205,9 +205,42 @@ has `l5 = SP - 640`, a fresh allocation below the stack pointer, so it writes
 entirely below the array. And no direct `store(frame, N)` goes past 1164 against
 a 1168-byte frame.
 
-**Next:** the remaining suspects inside `10425` are writes through computed
-pointers, and callees writing past their own frames. It has several dead assert
-bodies left to hijack for further bisection.
+### Probing by fixed address, which is what made bisection practical
+
+The array sits at `0x24bed0` on every run, so it can be read from *any* site,
+including inside callees where no local holds it — thirteen bytes:
+
+```
+41 24  41 d0 fd 92 01  28 02 00  36 02 00
+i32.const 36 ; i32.const 0x24bed0 ; i32.load ; i32.store
+```
+
+Put it in a **logging call whose message shows up in a real run**, not in a dead
+assert body. The sequence `41 <file> 41 00 41 <msg> <args> 10 <logger>` runs
+14–19 bytes, which is room to spare, and unlike an assert it is known to
+execute. Always run the control variant (`41 24 41 7f 36 02 00`) beside it.
+
+| where | `array[0]` |
+| --- | --- |
+| `wa_call_start_call` entry | `0x6b1108` |
+| `wa_call_start_internal` entry | `0x6b1108` |
+| `start_precall begin` log (offset 4506149) | `0x6b1108` |
+| `create_p2p_transport start` log (offset 5315086) | **0** |
+| `make_and_cache_offer` entry | 0 |
+| the `offer.cc:485` failure | 0 |
+
+**The slot is cleared between `start_precall begin` and
+`create_p2p_transport start`** — the stretch where the log shows participants
+being created and SSRCs generated.
+
+One confounder, recorded because it produced a silent null result: these are
+measured under `self_participant_probe`, and **not every site is on its path**.
+The `"updating peer jid to"` log inside `10532` (offset 4581479) did not execute
+there — control and probe both came back with the pre-existing `0xeeade615`. A
+message appearing in an `outgoing_call` log does not mean the probe reaches it.
+
+**Next:** probe more logging sites inside that window — the `wa_call_pa` SSRC
+lines, `field_stats` — each with its control, until the write is isolated.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
