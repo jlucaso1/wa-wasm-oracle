@@ -369,6 +369,17 @@ hold for this module was wrong. `_emscripten_thread_init` does not install it:
 it calls a four-line function that sets the TLS globals and nothing else.
 Establishing the stack is the host's job, and this host does not do it.
 
+**But those words are not there when a worker starts.** Read at the top of the
+thread, before `__emscripten_thread_init`, `+52` and `+56` are zero; the values
+above are read after it. Nothing in that function writes them — it sets four TLS
+globals and returns — so the guest's own `pthread_create` fills them, on the
+creating thread, while the new one is already running.
+
+Two things follow. The variants that installed a stack *before* thread init were
+not testing ordering: they read zeros and skipped. And a worker here can evidently
+begin against a half-initialised pthread, which the baseline never has cause to
+notice.
+
 **And installing it correctly still fails.** Five variants, all 24 lines and
 9-12 traps:
 
