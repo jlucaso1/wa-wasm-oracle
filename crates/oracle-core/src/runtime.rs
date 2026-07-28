@@ -310,6 +310,21 @@ impl Runtime {
         }
     }
 
+    /// How many entries this instance's function table has.
+    ///
+    /// Threads are separate instances and each builds its own table, which is
+    /// sound only while nothing changes at runtime. This module changes it —
+    /// `table.grow`, `table.fill`, `table.set` — so comparing this against what
+    /// a worker reports says whether their tables have drifted apart, and a
+    /// worker calling an index only this one has would trap.
+    pub fn table_size(&mut self) -> Option<u64> {
+        let name = self.store.data().shared.table_export.get()?.clone();
+        match self.instance.get_export(&mut self.store, &name) {
+            Some(Extern::Table(table)) => Some(table.size(&self.store)),
+            _ => None,
+        }
+    }
+
     pub fn free(&mut self, ptr: u32) -> Result<()> {
         self.call("free", &[Val::I32(ptr as i32)])?;
         Ok(())

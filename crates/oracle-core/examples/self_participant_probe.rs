@@ -567,6 +567,8 @@ fn main() -> anyhow::Result<()> {
         println!("  {}", line.trim());
     }
 
+    println!("main thread table size: {:?}", runtime.table_size());
+
     println!("--- low memory around 0x18 ---");
     if let Ok(b) = runtime.read(0, 64) {
         for (i, w) in b.chunks_exact(4).enumerate() {
