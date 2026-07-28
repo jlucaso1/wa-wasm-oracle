@@ -388,6 +388,13 @@ means something in how the module is driven is incompatible with moving the
 stack pointer after instantiation. Do not spend more attempts on that direction
 without a new hypothesis.
 
+One tempting hypothesis is already eliminated: that the stack pointer is an
+*imported* global and therefore shared between instances, which would explain
+both the identical readings and why writing it pulls the stack out from under a
+running thread. It is not. The module's 228 imports are 227 functions and one
+memory; all fifteen globals are defined in the module, so they are genuinely
+per-instance.
+
 With the allocation but no relocation: 202 lines, zero traps, three runs. So the
 relocation is what breaks it, whichever stack it installs.
 
