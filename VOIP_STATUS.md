@@ -102,10 +102,38 @@ The same command reports 10532's entry guard, which is the current frontier:
 
 `5233` is a validity mask over an enum of 0..12 — bits {0, 4, 5, 6, 10, 12} —
 and it is the same constant `10530` applies to a participant's `+8` field.
-`wa_call_invite` passes the literals `2` and `1` in that region of the argument
-list, and neither is in the mask. Treat that as a lead, not a finding: which
-literal lands on `arg3` is read off the caller's pushes, and the cheap way to
-settle it is to instrument 10532's entry and read `arg3` directly.
+`arg3` is **2**, measured (store `arg3 + 1`, read back 3), so it is indeed
+outside the mask.
+
+**That guard is not the bug.** Forcing the branch the other way — push `1` so
+the `br_if` is taken and the block body is skipped — gives four consistent runs
+of 82-88 lines, no `70008`, and new messages:
+
+```
+call_create_participants_for_..._call: self participant not created
+start_precall failed creating participants
+EVENT: Call is ending
+```
+
+So the block body is the **creation** path, not an error path, and 10532 is what
+creates a participant. The error vanished because the call died sooner — the
+exact trap the run-length check above exists to catch.
+
+### What the healthy baseline says, and the current lead
+
+A run that reaches ~200 lines logs `wa_call_group_create_participant updating
+peer jid to: 6677:0@lid`, and `getCallInfo` reports `participant_count: 2` — self
+(`99887766554433@lid`, `is_self`, state 7) and peer (`11223344556677@lid`,
+state 2). **The participants already exist in the group** by the time
+`wa_call_invite` calls 10532 to populate its own local array, and 10532 returns
+null. 10532 calls the JID comparator `10284` twice, which is the shape of an
+existence check.
+
+**Lead, not a finding: 10532 may be returning null because the participant is
+already there.** If that holds, the defect is ordering or duplication in how
+`startVoipCall` is driven, not anything about JID content. Settling it means
+instrumenting 10532's return points with distinct values, or its two `call
+10284` sites.
 
 ### What this replaces
 
@@ -159,11 +187,29 @@ Signatures on the path: `11198` 10 params / 1 result · `10534` 1/1 · `10530` 2
 table slot 746 (function 1108), which calls function 10386 — seven instructions
 that open `i32.const 1352840 / i32.load`.
 
-Two things worth knowing before trusting a run:
+Three things worth knowing before trusting a run:
 
+* **A run is not repeatable, so never conclude from one.** Four runs of the same
+  unpatched module through `outgoing_call`:
+
+  | run | engine-log lines | `70008` | traps |
+  | --- | --- | --- | --- |
+  | 1 | 24 | **0** | 11 |
+  | 2 | 202 | 2 | 0 |
+  | 3 | 202 | 2 | 2 |
+  | 4 | 201 | 2 | 3 |
+
+  A healthy baseline reaches ~200 lines and reports the failure **twice**. The
+  short run reports *no* `70008` — not because an offer was built, but because
+  nothing got that far. **The health signal is how far the log got**; "the error
+  disappeared" on its own reads a dead run as a fix, which is how a wrong
+  conclusion survived several rounds here. Compare only runs of comparable
+  length, and run each variant three or four times.
 * A healthy run has `0x6d0018` there and structured data around `1352680`. A run
   showing `0xe0c70adc` and high-entropy data died before reaching the offer, and
-  the 70008 never appears in it.
+  the 70008 never appears in it. Note the probe (`self_participant_probe`) traps
+  inside `startVoipCall` on *every* run, baseline included, so it is a memory
+  reader, not a progress meter.
 * Whether the engine's log is real. After an incoming offer followed by an
   outgoing call it sometimes fills with random printable bytes instead of
   messages, which reads as "the call went quiet" when it means the opposite.
