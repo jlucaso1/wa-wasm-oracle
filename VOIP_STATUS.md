@@ -134,23 +134,47 @@ And the semantics, read rather than inferred:
   participants live at `group + 44 + i*4` — previously an assumption.
 * `10535`'s loop walks indices 0 and 1 and compares both.
 
-### Where this stands: a contradiction, stated plainly
+### What the group has nothing to do with
 
-Every measured fact says the lookup should succeed. The key is the peer's JID,
-participant[1] carries the same string, the loop reaches it, the guard passes,
-the comparison returns 1 on equality, and the state is not filtered — and
-`10530` still returns 0 and the offer still fails.
+Those group readings all say the lookup *should* succeed, and that is the point:
+it never gets far enough to use them. Reading the locals at the same site, with
+a control:
 
-So a premise is still false, and the honest next step is to stop deducing and
-measure the remaining links directly: the return of `f10284` *inside* 10535, the
-return of `get_participant`, and the bodies of `f8468_pj_strcmp` and `f3719`.
-One specific suspect is the `pj_str_t` layout at `+8`: the dumps show
-`{ptr @ +8, 0 @ +12, len @ +16, 0 @ +20}`, and which word `pj_strcmp` treats as
-the length changes the answer.
+| read at the failing site | value |
+| --- | --- |
+| control, stores `-1` | `0xffffffff` — the site runs, the address works |
+| `l1`, the array `11198` was handed | `0x24bed0` |
+| `l11`, i.e. `array[0]` | **0** |
+
+And `0x24bed0` is exactly what `wa_call_start_call` was handed at entry, where
+`array[0]` was `0x6b1108` and the JID beyond it was the peer's. **The array
+pointer never changes; the contents of slot 0 are gone by the time the offer is
+built.**
+
+That closes the chain, and it also redeems a reading discarded earlier:
+`get_participant` logs line **1382**, its null-argument branch, which is exactly
+what a null key produces.
+
+```
+array[0] cleared  ->  10297 returns null  ->  10530(ctx, null)
+                  ->  get_participant takes its null-argument branch (1382)
+                  ->  0  ->  offer.cc:485  ->  70008
+```
+
+**The array lives on the stack.** At the moment of failure the stack pointer is
+`0x24b8c0` and the array is at `0x24bed0` — 1552 bytes above it, inside the live
+region, so this is not a use-after-free of popped stack. Something writes over
+that slot in between. (The `l27 = SP - 16` in `10425`'s LID-consistency loop is a
+temporary copy of the `{ptr, count}` pair, not the array; ruled out.)
+
+**Next:** find what writes `0x24bed0` between `wa_call_start_call`'s entry and
+the offer.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
-gone — the strings are identical. And "the key is null" was a body patch on
-shared functions; measured properly it is a valid pointer.
+gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
+`+8` of the `pj_str_t`, which matches the dumps. And "the key is null" was first
+measured by patching shared function bodies, which was unsound; it happens to be
+true, and the sound measurement is the one above.
 
 ### The caller this file used to name, and why it is the wrong one
 
