@@ -178,6 +178,36 @@ engine is right to reject — it answers `70004`. A bidirectional call here need
 that bridge emulated: a loopback data channel, `handleOnMessageFromHeap` fed,
 and a relay list supplied.
 
+## A sibling project that does place calls, and why its recipe does not transfer
+
+`~/projects/meowmeow-node-wasm` drives a WhatsApp Web VoIP module from Node and
+successfully places calls. Its module is not this one:
+
+|  | that build | this build |
+| --- | --- | --- |
+| embind surface | 82 functions | 206 functions |
+| `initVoipStack` | `(str, str, str, bool, u32, u32, u32, u32)` | `(str, str, str)` |
+| `startVoipCall` | 8 arguments | 7 arguments |
+| peer JID in its example | `…@s.whatsapp.net` | rejected — `peer_participant_jids must be LID` |
+
+The extra `initVoipStack` arguments are configuration: `voipParamsVersion`,
+`maxParticipants`, `maxGroupSize`. This build takes none of them, and rejects
+phone-number peers outright. It is the newer of the two, and configuration has
+moved out of initialisation — which lines up with what it says at runtime,
+where `getVoipParam("options.*")` answers empty and the incoming path reports
+`Application settings not loaded`.
+
+So the shape of the fix is not "pass more arguments". Something has to supply
+settings the way a server would. `the_call_entry_points_take_the_arguments_this_build_declares`
+in `tests/voip_oracle.rs` pins the signatures so a capture update cannot quietly
+invalidate this comparison.
+
+Three things borrowed from that project and measured here, none of which
+changes the outcome: its JID shapes (bare LID for self, PN for the user JID, no
+device suffix), the peer's PN as the fifth `startVoipCall` argument, and its
+readiness wait before placing a call. Its SCTP relay bridge remains the best
+reference for emulating the data path.
+
 ## Reading the engine's state directly
 
 Most of what is above was inferred from disassembly, and inference has a poor

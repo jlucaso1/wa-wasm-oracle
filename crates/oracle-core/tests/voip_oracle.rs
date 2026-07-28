@@ -182,3 +182,52 @@ fn accepts_abprop_overrides() {
         Value::Void
     );
 }
+
+/// The call-entry signatures, pinned because a sibling project's do not match.
+///
+/// `~/projects/meowmeow-node-wasm` drives a WhatsApp Web VoIP module from Node
+/// and does place calls, which makes it tempting to copy its argument lists.
+/// Its module is a different build — 82 embind functions against this one's
+/// 206 — and its entry points take more arguments:
+///
+/// ```text
+///                  meowmeow's build                          this build
+/// initVoipStack    (str, str, str, bool, u32, u32, u32, u32)  (str, str, str)
+/// startVoipCall    (str, List, str, bool, str, bool, bool, …) (str, List, str, bool, str, bool, …)
+/// ```
+///
+/// The extra `initVoipStack` arguments are configuration — `voipParamsVersion`,
+/// `maxParticipants`, `maxGroupSize`. This build does not accept them, which is
+/// consistent with what the engine says at runtime: `getVoipParam("options.*")`
+/// answers empty and the incoming path reports `Application settings not
+/// loaded`. Configuration moved out of init, so it has to arrive some other
+/// way, and passing more arguments cannot substitute for that.
+///
+/// If a capture update changes these, the comparison above needs redoing before
+/// any of it is trusted.
+#[test]
+fn the_call_entry_points_take_the_arguments_this_build_declares() {
+    let mut runtime = voip_or_skip!();
+    let registry = runtime.embind();
+
+    // embind puts the return type first in `arg_types`, so the parameter count
+    // is one less than its length.
+    let arity = |name: &str| -> Option<usize> {
+        registry
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .map(|function| function.arg_types.len() - 1)
+    };
+
+    assert_eq!(
+        arity("initVoipStack"),
+        Some(3),
+        "initVoipStack takes three JIDs here; meowmeow's build takes eight arguments"
+    );
+    assert_eq!(
+        arity("startVoipCall"),
+        Some(7),
+        "startVoipCall takes seven arguments here; meowmeow's build takes eight"
+    );
+}

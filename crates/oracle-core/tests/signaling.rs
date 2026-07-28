@@ -1202,3 +1202,48 @@ fn engine_with_identity() -> Option<Runtime> {
     }
     None
 }
+
+/// This build refuses a phone-number peer: calls must be placed to LIDs.
+///
+/// It matters beyond this repository. `~/projects/meowmeow-node-wasm` places
+/// calls against an older module and passes `…@s.whatsapp.net` as the peer, so
+/// anyone porting that recipe here will hit this and have no idea why. The
+/// engine says it plainly — `peer_participant_jids must be LID, enforce LID for
+/// all calls` — and that sentence is the ground truth whatsapp-rust has to
+/// match.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
+    let _serial = common::engine_lock();
+    let Some(mut runtime) = engine_with_identity() else {
+        eprintln!("skipping: no capture (set WA_WASM_DIR)");
+        return;
+    };
+
+    let mark = runtime.engine_log().len();
+    let outcome = runtime.call_embind(
+        "startVoipCall",
+        &[
+            Value::Str("11223344556677@s.whatsapp.net".to_owned()),
+            Value::StringList(vec!["11223344556677:0@s.whatsapp.net".to_owned()]),
+            Value::Str("0011223344556677".to_owned()),
+            Value::Bool(false),
+            Value::Str("11223344556677@s.whatsapp.net".to_owned()),
+            Value::Bool(false),
+            Value::Bytes(Vec::new()),
+        ],
+    );
+    runtime.refuel();
+    runtime.settle(Duration::from_secs(5));
+
+    let lines = runtime.engine_log_from(mark);
+    if runtime.engine_log_overflowed() {
+        eprintln!("engine log overflowed; nothing can be concluded from absence");
+        return;
+    }
+
+    assert!(
+        lines.iter().any(|line| line.contains("must be LID")),
+        "the engine should refuse a phone-number peer and say so: {outcome:?} {lines:?}"
+    );
+}

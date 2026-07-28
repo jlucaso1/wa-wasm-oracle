@@ -21,9 +21,9 @@
 use oracle_core::{Catalog, Runtime, ThreadPolicy, Value};
 
 /// Fictitious, like every identity in this repository.
-const SELF: &str = "15550002222@c.us";
-const SELF_DEVICE: &str = "15550002222:0@c.us";
-const SELF_LID: &str = "99887766554433:0@lid";
+const SELF: &str = "99887766554433@lid";
+const SELF_DEVICE: &str = "15550002222@s.whatsapp.net";
+const SELF_LID: &str = "99887766554433@lid";
 const PEER_LID: &str = "11223344556677@lid";
 const PEER_LID_DEVICE: &str = "11223344556677:0@lid";
 
@@ -179,6 +179,11 @@ fn main() -> anyhow::Result<()> {
         ],
     )?;
     runtime.refuel();
+    // meowmeow-node-wasm waits for the stack to announce itself before placing
+    // a call — `waitForVoipStackReady`, resolved by an `onVoipReady` callback
+    // or a 3 s fallback "for builds where onVoipReady never fires". We were
+    // calling straight into `startVoipCall`.
+    runtime.settle(std::time::Duration::from_secs(3));
     dump_globals(&mut runtime, "after init");
     // Same accessor, before any call: distinguishes a field the call populates
     // from one that is simply always there.
@@ -233,8 +238,10 @@ fn main() -> anyhow::Result<()> {
             // four runs it makes no difference: 70008 still appears in three of
             // them, all with a healthy context.
             Value::Bool(false),
-            Value::Str(PEER_LID.into()),
-            Value::Bool(false),
+            // meowmeow-node-wasm passes the peer's *PN* here, not the LID
+            // again, and `1` for the flag after it.
+            Value::Str("11223344556677@s.whatsapp.net".into()),
+            Value::Bool(true),
             Value::Bytes(Vec::new()),
         ],
     );
