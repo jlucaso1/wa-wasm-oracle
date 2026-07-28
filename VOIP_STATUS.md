@@ -407,33 +407,29 @@ the workers depend on is evidently tied to it, and nothing measured so far says
 what. A reasonable next suspicion is that these workers are not really executing
 against their own instance's globals the way this harness assumes.
 
-An independent implementation disagrees with this one on a structural point
-worth checking. `unwasm`'s threading model — instances over one shared memory,
-each with its own globals — states that **the memory and the table are shared**.
-`threads.rs` here states the opposite: each instance builds its own table from
-the element segments, on the grounds that they all initialise identically. That
-holds for static function pointers and stops holding the moment anything is
-registered at runtime — and this module does exactly that: **16 `table.grow`,
-28 `table.fill`, 7 `table.copy` and thousands of `table.set`**. Each instance
-mutates its own copy, so the main thread's table and the workers' diverge as
-soon as anything registers a function. "They all initialise identically" is only
-true at t=0.
+An independent implementation disagrees with this one on a structural point.
+`unwasm`'s threading model — instances over one shared memory, each with its own
+globals — states that **the memory and the table are shared**. `threads.rs` here
+states the opposite: each instance builds its own table from the element
+segments, on the grounds that they all initialise identically. That holds for
+static function pointers and stops holding the moment anything is registered at
+runtime.
 
-That suggests one explanation for the whole symptom. With its stack pointer at
-the initial value a worker parks early in a futex and never makes those indirect
-calls; move the pointer and it gets further, reaches an index only the main
-thread's table has, and traps — which would make moving the stack the *trigger*
-and the stale table the *cause*. Every table measures 9291 entries at thread
-start — and the main thread's still measures 9291 at the end, so **nothing grows
-one**. And the occupancy does not move either: 9290 slots
-are filled right after the constructors and 9290 at the end, so no `table.set`
-fills an empty slot or clears one. **The mechanism is refuted.** All that
-survives is the narrow case of a slot whose function is replaced by another,
-which changes neither count — and nothing observed suggests it happens.
+**In this module nothing ever is.** `wasm-tools print` finds zero `table.grow`,
+`table.set`, `table.fill` and `table.copy`, and the table is declared
+`(table 9291 9291 funcref)` — minimum equal to maximum, so it cannot grow, and
+defined rather than imported. Independently, `unwasm` models none of those
+opcodes and refuses by name any it cannot model, yet decompiles all 13347
+functions here without complaint. Measurement agrees: 9291 entries at every
+thread's start and at the main thread's end, 9290 slots filled after the
+constructors and 9290 at the end.
 
-The opcodes are present in the module and simply are not reached on this path,
-which is worth remembering: counting opcodes says what a module *can* do, never
-what it does.
+**How the opposite claim got its evidence is the part worth keeping.** The counts
+that suggested it — "16 `table.grow`, 4185 `table.set`" — came from searching the
+binary for those *byte values*. A `0x26` inside an immediate, a data segment or a
+function index matches just as well. Counting bytes is not counting instructions:
+use `wasm-tools print`, or a decoder that walks the code section, never a search
+over the whole file.
 
 Testing it means giving the workers the main thread's table, which wasmtime does
 not make easy: a `Func` belongs to its store, so entries cannot simply be copied
