@@ -239,8 +239,25 @@ The `"updating peer jid to"` log inside `10532` (offset 4581479) did not execute
 there — control and probe both came back with the pre-existing `0xeeade615`. A
 message appearing in an `outgoing_call` log does not mean the probe reaches it.
 
-**Next:** probe more logging sites inside that window — the `wa_call_pa` SSRC
-lines, `field_stats` — each with its control, until the write is isolated.
+**Store `value + 1`, not `value`.** Address 36 is not reliably zero — an
+unpatched run already has `0xeeade615` sitting there — so a probe that reads a
+garbage-looking word cannot be told apart from a probe that never ran. Adding
+`41 01 6a` before the store costs three bytes and makes 0 mean "did not run".
+
+It paid for itself immediately. Probing the SSRC log site
+(`call_generate_ssrc_for_participant`, offset 4667237, 18 bytes):
+
+| run | `*(36)` | reading |
+| --- | --- | --- |
+| 1 | `0x6b1109` | `array[0]` is `0x6b1108` — **still populated** |
+| 2 | `0xeeade615` | did not store; the site is not reached every run |
+
+Without the `+1`, run 2 reads as "already cleared" and the window closes on the
+wrong side. **The window is now between SSRC generation and
+`create_p2p_transport start`.**
+
+**Next:** probe the sites between those two — `Generated app_data_ssrc`, the
+peer's SSRC lines — each with its control and the `+1` encoding.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
