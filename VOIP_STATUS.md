@@ -100,9 +100,57 @@ unproven, about *why*. **Never instrument the body of a shared function here.**
 Patch the specific call site, which the decompiled source makes findable, or a
 function with one caller — and always pair it with a control variant.
 
-**Next experiment:** instrument `11198`'s call site inside `10425` (there are
-only two sites, and this is the one that runs) to capture `l3` and `l4` as that
-call actually receives them.
+### The one instrumentation site that is above suspicion
+
+The body of the `offer.cc:485` assert inside `make_and_cache_offer` — sixteen
+bytes, `41 00 41 c9da2e 41 e1df12 41 e503 10 b642`, **unique in the module**, and
+reached only when the offer fails. `11198` has two call sites and only `10425`'s
+runs, so a patch here reports the failing path and nothing else. Six more bytes
+follow (`41 f8a204 21 0b`, the `70008` and its store) and can be absorbed for a
+longer expression, at the cost of the return value.
+
+The mould: `41 24` (address 36), `20 00` (arg0), the loads, `36 02 00`, padded
+with `01`. Everything below was read that way, two or three runs each, stable:
+
+| read on the failing path | value |
+| --- | --- |
+| the key passed to the lookup | `0x6b1018`, `+8` → `"11223344556677@lid"`, len 18 |
+| `ctx->[659164]`, the group | `0x8d0018` — **not null** |
+| `group->[552]`, participant count | **2** |
+| `participant[0]`'s jid `+8` | `"99887766554433@lid"` — self |
+| `participant[1]`'s jid `+8` | `"11223344556677@lid"` — **identical to the key** |
+| `participant[0]->[8]`, its state | 7 |
+| `participant[1]->[8]`, its state | 2 |
+| `participant[i]->[0]`, the loop's guard | non-null for both |
+
+And the semantics, read rather than inferred:
+
+* `f10284(a, b)` returns **1 on a match**: `if a == b return 1; r = (a==0||b==0) ?
+  1 : pj_strcmp(a+8, b+8); return r == 0`.
+* `f10530(ctx, key)` is not a plain lookup — it finds the participant and then
+  **filters by state**: `s = *(p+8); if s <= 12 return ((5233 >> s) & 1) ? 0 : p`.
+  The mask is bits {0, 4, 5, 6, 10, 12}; neither 7 nor 2 is in it.
+* `f10619(group, i)` is `*(f3719(group+44, i, 127, 4))`, which confirms
+  participants live at `group + 44 + i*4` — previously an assumption.
+* `10535`'s loop walks indices 0 and 1 and compares both.
+
+### Where this stands: a contradiction, stated plainly
+
+Every measured fact says the lookup should succeed. The key is the peer's JID,
+participant[1] carries the same string, the loop reaches it, the guard passes,
+the comparison returns 1 on equality, and the state is not filtered — and
+`10530` still returns 0 and the offer still fails.
+
+So a premise is still false, and the honest next step is to stop deducing and
+measure the remaining links directly: the return of `f10284` *inside* 10535, the
+return of `get_participant`, and the bodies of `f8468_pj_strcmp` and `f3719`.
+One specific suspect is the `pj_str_t` layout at `+8`: the dumps show
+`{ptr @ +8, 0 @ +12, len @ +16, 0 @ +20}`, and which word `pj_strcmp` treats as
+the length changes the answer.
+
+Two theories died getting here, both of them mine. The JID-shape mismatch is
+gone — the strings are identical. And "the key is null" was a body patch on
+shared functions; measured properly it is a valid pointer.
 
 ### The caller this file used to name, and why it is the wrong one
 

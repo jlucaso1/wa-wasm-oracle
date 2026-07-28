@@ -579,7 +579,26 @@ fn main() -> anyhow::Result<()> {
         if let Ok(block) = runtime.read(ptr, 64) {
             for (i, w) in block.chunks_exact(4).enumerate() {
                 let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
-                println!("  +{:<3} = {v:#x}", i * 4);
+                // What an entry *is* decides the diagnosis: a struct pointer and
+                // a `char*` are both plausible-looking words, and the engine
+                // dereferences one of them as the other if the host hands it the
+                // wrong kind. Showing the text settles it without a second run.
+                let text = runtime
+                    .read(v, 24)
+                    .ok()
+                    .filter(|b| b.first().is_some_and(|c| (0x20u8..0x7f).contains(c)))
+                    .map(|b| {
+                        b.iter()
+                            .copied()
+                            .take_while(|c| (0x20u8..0x7f).contains(c))
+                            .map(char::from)
+                            .collect::<String>()
+                    })
+                    .filter(|t| t.len() >= 4);
+                match text {
+                    Some(t) => println!("  +{:<3} = {v:#x}  -> {t:?}", i * 4),
+                    None => println!("  +{:<3} = {v:#x}", i * 4),
+                }
             }
         }
     }
