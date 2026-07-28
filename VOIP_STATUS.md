@@ -351,10 +351,45 @@ stack and recorded it in the pthread struct — that is why `establishStackSpace
 the guest knows nothing about, while its TLS and canaries still refer to the
 first.
 
-**Next:** decompile `_emscripten_thread_init` — exported, six parameters, the
-first being the pthread pointer — and read which offsets of that argument it
-takes the stack from. Then hand those to `emscripten_stack_set_limits` and
-`stackRestore`, instead of `+52/+56`, which are already known not to hold here.
+### The `+52/+56` offsets do hold here, and it still does not help
+
+Dumping each worker's `struct pthread`:
+
+```
+thread 1 pthread 0x820030: +52=0x832350 +56=0x10000
+thread 2 pthread 0x880030: +52=0x892350 +56=0x10000
+thread 3 pthread 0x892370: +52=0x8a4690 +56=0x10000
+thread 4 pthread 0xe00030: +52=0xe12350 +56=0x10000
+thread 5 pthread 0xe12370: +52=0xe24690 +56=0x10000
+```
+
+A distinct top per thread and a size of 64 KiB — so the guest's own
+`pthread_create` did allocate a stack, and the note claiming those offsets do not
+hold for this module was wrong. `_emscripten_thread_init` does not install it:
+it calls a four-line function that sets the TLS globals and nothing else.
+Establishing the stack is the host's job, and this host does not do it.
+
+**And installing it correctly still fails.** Five variants, all 24 lines and
+9-12 traps:
+
+1. write global 0 with a malloc'd stack, before thread init
+2. the same, after
+3. `emscripten_stack_set_limits` + `stackRestore` with a malloc'd stack, before
+4. the same, after
+5. `set_limits` + `stackRestore` with **the guest's own stack from +52/+56**
+
+With the allocation but no relocation: 202 lines, zero traps, three runs. So the
+relocation is what breaks it, whichever stack it installs.
+
+Something else here depends on threads sharing that region, or on when the
+switch happens — the entry point runs on the new stack while earlier state was
+built on the old. **Do not re-run those five.** Diff a 24-line log against a
+healthy one to find where it dies, and look at `emscripten_stack_init`, also
+exported, which may need calling on the thread's instance.
+
+Exports worth knowing: `emscripten_stack_set_limits`, `..._get_base`,
+`..._get_end`, `..._get_current`, `..._get_free`, `emscripten_stack_init`,
+`stackSave`, `stackRestore`, `stackAlloc`, `pthread_self`.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
