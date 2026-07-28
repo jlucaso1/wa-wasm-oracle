@@ -407,6 +407,17 @@ the workers depend on is evidently tied to it, and nothing measured so far says
 what. A reasonable next suspicion is that these workers are not really executing
 against their own instance's globals the way this harness assumes.
 
+An independent implementation disagrees with this one on a structural point
+worth checking. `unwasm`'s threading model — instances over one shared memory,
+each with its own globals — states that **the memory and the table are shared**.
+`threads.rs` here states the opposite: each instance builds its own table from
+the element segments, on the grounds that they all initialise identically. That
+holds for static function pointers and stops holding the moment anything is
+registered at runtime, which embind does constantly. Whether it bears on the
+stack pointer is unknown, but a harness whose threads disagree about what a
+table index means is the kind of mismatch that produces symptoms like this
+one.
+
 **The earlier discriminator, still worth keeping.**
 Running `emscripten_stack_init` on a worker's instance and then
 `emscripten_stack_set_limits(top, end)` with the pthread's own `+52/+56`, but
