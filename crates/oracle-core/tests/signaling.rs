@@ -1247,3 +1247,118 @@ fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
         "the engine should refuse a phone-number peer and say so: {outcome:?} {lines:?}"
     );
 }
+
+/// Does the `<voip_settings>` blob in an offer end up where `getVoipParam` reads?
+///
+/// An outgoing call is blocked by configuration this build no longer takes at
+/// init — `getVoipParam("options.*")` answers empty, and an older module got
+/// the same values as `initVoipStack` arguments. An incoming offer does carry a
+/// settings blob, and the engine parses it (mislabelling it compressed gets the
+/// whole offer rejected), so the question is whether handling one leaves those
+/// values readable.
+///
+/// If it does, feeding a synthetic offer is a way to configure the engine
+/// without a server. If it does not, settings arrive by some other channel and
+/// that is worth knowing before building anything on this idea.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn an_offers_settings_blob_becomes_readable_through_get_voip_param() {
+    let _serial = common::engine_lock();
+    let Some(mut runtime) = engine_with_identity() else {
+        eprintln!("skipping: no capture (set WA_WASM_DIR)");
+        return;
+    };
+
+    let read = |runtime: &mut Runtime, name: &str| -> Option<String> {
+        let value = runtime.call_embind("getVoipParam", &[Value::Str(name.to_owned())]);
+        runtime.refuel();
+        value
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+    };
+
+    // The blob this test sends sets `enable_48khz_rtp_clock` under `options`,
+    // so that is the name to look for — a key we know is in there.
+    let name = "options.enable_48khz_rtp_clock";
+    let before = read(&mut runtime, name);
+
+    let payload = serialize(&offer_for(&runtime), true);
+    let _ = deliver(&mut runtime, payload);
+
+    let after = read(&mut runtime, name);
+    eprintln!("getVoipParam({name}): before={before:?} after={after:?}");
+
+    // It does. An incoming offer configures the engine, and the values it
+    // carries are readable afterwards — so a synthetic offer is a way to set
+    // voip params without a server, which is what this build otherwise lacks.
+    assert_eq!(
+        before.as_deref(),
+        Some(""),
+        "nothing configured before the offer"
+    );
+    assert_eq!(
+        after.as_deref(),
+        Some("false"),
+        "the offer's settings blob should be readable through getVoipParam"
+    );
+}
+
+/// Does an offer's settings blob move the bytes that block an outgoing offer?
+///
+/// `make_and_cache_offer` fails at `offer.cc:430` when both terms of a guard are
+/// zero. One of them is `ctx[662166]`, read straight off the call context. The
+/// other is `arg2`, which comes from `params[3856]` — and `params` is
+/// `wa_call_start_call`'s own first argument, *not* the context, so the reading
+/// of `ctx[3856]` below is of a different object and means nothing on its own.
+/// It is measured anyway because it costs nothing and its stability is worth
+/// knowing.
+///
+/// An incoming offer *does* configure the engine: values from its
+/// `<voip_settings>` blob are readable through `getVoipParam` afterwards. So the
+/// question is whether that channel reaches `ctx[662166]`.
+///
+/// The context is reachable at `*(u32*)1352840`; the engine gets there the same
+/// way, through the function `getCallInfo` calls.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn an_offer_does_not_move_the_bytes_that_gate_the_outgoing_offer() {
+    let _serial = common::engine_lock();
+    let Some(mut runtime) = engine_with_identity() else {
+        eprintln!("skipping: no capture (set WA_WASM_DIR)");
+        return;
+    };
+
+    let guard_bytes = |runtime: &Runtime| -> Option<(u8, u8)> {
+        let ctx = runtime
+            .read(1_352_840, 4)
+            .ok()
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))?;
+        if ctx < 0x10000 {
+            return None;
+        }
+        Some((
+            *runtime.read(ctx + 3856, 1).ok()?.first()?,
+            *runtime.read(ctx + 662_166, 1).ok()?.first()?,
+        ))
+    };
+
+    let Some(before) = guard_bytes(&runtime) else {
+        eprintln!("skipping: no call context yet");
+        return;
+    };
+
+    let payload = serialize(&offer_for(&runtime), true);
+    let _ = deliver(&mut runtime, payload);
+
+    let after = guard_bytes(&runtime);
+    eprintln!("guard bytes (3856, 662166): before={before:?} after={after:?}");
+
+    // Pinned as the current answer: configuring through an offer does not
+    // reach these. If this starts failing, the settings channel does move them
+    // and the outgoing blocker is reachable from here.
+    assert_eq!(
+        after,
+        Some((0, 0)),
+        "an offer moved ctx[662166] — the settings channel reaches the guard"
+    );
+}

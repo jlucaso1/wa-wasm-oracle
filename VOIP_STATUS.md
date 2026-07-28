@@ -57,6 +57,42 @@ shape is not the variable — five forms (bare LID, device LID, legacy `@c.us` i
 the fifth argument, self added to the list, bare list) all fail at the same
 site.
 
+### The conversion that one side gets and the other does not
+
+The engine has a device-to-user conversion, `wa_call_user_jid_create_from_device_jid`
+(function 10274, `common/wa_call_jid.cc`). Counting calls to it settles the
+asymmetry:
+
+| | calls 10274 |
+| --- | --- |
+| `wa_call_group_create_participant` — builds the participants | **twice** |
+| `create_participant_jid` — builds the lookup key | **never** |
+
+Participants are converted and stored in user form; the key is not converted and
+stays in device form. That is why `pj_strcmp` at `offer.cc:485` compares twenty
+characters against eighteen.
+
+The key's chain is `startVoipCall → create_participant_jid →
+voipBridgeJidToVoipJID → wa_call_participant_jid_create_with_params`, and the
+last of those copies the JID without normalising it. Note that
+`wa_call_participant_jid_get_user_jid` (10297) does not convert anything despite
+its name — it is a single load.
+
+There is no second index to fall back on: `get_participant` and
+`wa_call_group_get_participant_by_jid` both compare only the user field. The
+sync routine that would canonicalise everything runs after a server offer or
+ack, which is later than the point an outgoing call fails.
+
+Passing the peer list in user form does not help — measured over three healthy
+runs — so the device form is derived internally rather than copied from what the
+host passes.
+
+What is *not* measured: the key's own form. `ctx[1288]` (device) and the
+participants (user) were read out of memory; the key itself never was. The chain
+above is disassembly, so treat "the key is device-form" as well-supported
+inference, not as a reading. Closing that needs instrumentation at 10293 or
+10297.
+
 ### Why the comparison fails, and the proof
 
 The two sides carry JIDs in different shapes. Read out of memory:
