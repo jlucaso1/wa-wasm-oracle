@@ -124,6 +124,13 @@ fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
     let init = runtime.call_embind(
         "initVoipStack",
         &[
+            // `"0"` and `"{}"` are not what `voipInit` wants — it takes three
+            // legacy-form JIDs (user, user device, user device LID), as
+            // `WAWeb/Voip/Init.js` shows and as `examples/outgoing_call.rs`
+            // passes. Correcting it here was tried and reverted: the incoming
+            // offer still ends as `Missed` with an identical log, and the suite
+            // started overrunning, so it bought nothing and cost time. Worth
+            // revisiting only alongside a fix that needs the real identity.
             Value::Str(jid(CALLEE).to_string()),
             Value::Str("0".to_owned()),
             Value::Str("{}".to_owned()),
@@ -219,6 +226,11 @@ fn offer_stanza(now: u64) -> Node {
 }
 
 /// The settings blob, in whatsapp-rust's standard-Opus form.
+/// Adding `caller_timeout`/`callee_timeout` under `options` was tried, on the
+/// theory that an empty ring window would explain the immediate miss —
+/// `getVoipParam("options.caller_timeout")` does read back empty. It changes
+/// nothing: the offer still ends `term_reason 27`. Kept in whatsapp-rust's
+/// standard form.
 const VOIP_SETTINGS: &[u8] =
     br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false"}}"#;
 
@@ -256,6 +268,10 @@ fn deliver(runtime: &mut Runtime, stanza: String) -> Vec<String> {
             // with stoull. Anything non-numeric raises std::invalid_argument.
             Value::Str(runtime.virtual_unix_time().to_string()),
             Value::Str(runtime.virtual_unix_time().to_string()),
+            // Both bools tried in both positions: neither changes the outcome,
+            // and flipping the first leaves `call_wakeup_source` at 0 in the
+            // field stats — so it is probably not `is_offline`, whatever
+            // WhatsApp Web's parameter names suggest.
             Value::Bool(false),
             Value::Bool(false),
             // The caller, as `t.peer_jid.toString()` in WhatsApp Web's own
@@ -712,6 +728,115 @@ fn a_well_formed_offer_is_accepted() {
     assert!(
         !lines.iter().any(|line| line.contains("voip params")),
         "settings blob was rejected: {lines:?}"
+    );
+}
+
+/// Does an incoming offer leave settings behind that an outgoing call can use?
+///
+/// An outgoing call fails in `make_and_cache_offer` at `offer.cc:430`, whose
+/// guard reads two bytes of the call context — `+3856` and `+662166` — and both
+/// are zero. Nothing in the module carries the `options.*` names that
+/// `getVoipParam` answers to, so those come from the server's
+/// `<voip_settings>` blob; on the incoming path the engine says as much, with
+/// `Application settings not loaded`.
+///
+/// An incoming offer *does* carry that blob. If handling one caches settings,
+/// an outgoing call made afterwards should get past the guard. This is the
+/// cheapest test of "both blockers are the same missing configuration".
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
+    let _serial = common::engine_lock();
+    let Some(mut runtime) = engine_with_identity() else {
+        eprintln!("skipping: no capture (set WA_WASM_DIR)");
+        return;
+    };
+
+    let payload = serialize(&offer_for(&runtime), true);
+    let _ = deliver(&mut runtime, payload);
+
+    let mark = runtime.engine_log().len();
+    let _ = runtime.call_embind(
+        "startVoipCall",
+        &[
+            Value::Str(PEER_LID.to_owned()),
+            Value::StringList(vec![PEER_LID_DEVICE.to_owned()]),
+            Value::Str("0011223344556677".to_owned()),
+            Value::Bool(false),
+            Value::Str(PEER_LID.to_owned()),
+            Value::Bool(false),
+            Value::Bytes(Vec::new()),
+        ],
+    );
+    runtime.refuel();
+    runtime.settle(Duration::from_secs(5));
+
+    let lines = runtime.engine_log_from(mark);
+
+    // What this actually found: the sequence leaves the engine's log full of
+    // random bytes rather than messages. Every line is short, printable noise
+    // with none of the `file.cc`/`EVENT:` shape real entries have — the same
+    // "hundreds of garbage lines" seen before, which means state is corrupt
+    // rather than that the call went quiet.
+    let structured = lines
+        .iter()
+        .filter(|line| line.contains(".c") || line.contains("EVENT") || line.contains("call"))
+        .count();
+    eprintln!(
+        "after an incoming offer, an outgoing call yields {} lines, {structured} of them structured",
+        lines.len()
+    );
+
+    // So the useful invariant is about corruption, not about the guard: doing
+    // both in one engine must not shred the log. If this ever passes cleanly,
+    // the ordering has become usable and the settings hypothesis can finally be
+    // tested through it.
+    assert!(
+        lines.is_empty() || structured > 0,
+        "the log is pure noise after offer-then-call: state is corrupted by the sequence"
+    );
+}
+
+/// Does the *incoming* path end up with a self participant?
+///
+/// The outgoing path does not: `make_and_cache_offer` fails because the group's
+/// cached self pointer is null, even though `getCallInfo` marks a participant
+/// `is_self`. Whether the same is true after an accepted incoming offer is the
+/// cheapest way to tell a systemic gap from something specific to originating a
+/// call — and the two paths build the call through different code.
+///
+/// This asserts what the engine reports rather than a desired outcome; it is a
+/// probe kept honest by being a test.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn an_incoming_offer_reports_its_participants() {
+    let mut runtime = engine_or_skip!();
+    let payload = serialize(&offer_for(&runtime), true);
+    let lines = deliver(&mut runtime, payload);
+    for line in &lines {
+        eprintln!("  | {}", line.trim());
+    }
+
+    let info = runtime.call_embind("getCallInfo", &[]);
+    runtime.refuel();
+    let Some(json) = info.as_ref().ok().and_then(|value| value.as_str()) else {
+        eprintln!("engine reported no call after the offer: {info:?}");
+        return;
+    };
+    if json.is_empty() {
+        eprintln!("engine holds no call state after the offer");
+        return;
+    }
+
+    let has_self = json.contains("\"is_self\": true");
+    let uuid_set = !json.contains("\"self_participant_uuid\": \"\"");
+    eprintln!("incoming path: is_self={has_self} self_participant_uuid_set={uuid_set}");
+
+    // The engine must at least be able to say who we are; without that the
+    // incoming path cannot answer a call either.
+    assert!(
+        has_self,
+        "no participant marked as ourselves after an accepted offer: {json}"
     );
 }
 

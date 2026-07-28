@@ -21,23 +21,106 @@ because nothing was ever constructed to send. Any account of this that starts
 from "the outbound channel is blocked" is wrong — that reading survived a long
 time and cost accordingly.
 
-`make_and_cache_offer` is function 11198 (`offer.cc`). At line 463 it requires
-`wa_call_group_get_self_participant` to be non-null; that returns
-`group->[592]`, and the pointer is null.
+`make_and_cache_offer` is function 11198 (`offer.cc`), and it returns 70008
+from **nine** different places — at `offer.cc` lines 296, 430, 463, 485, 767,
+776, 784 and 789. Guessing which one fires wasted a lot of time; two of them
+were patched open with no effect at all.
 
-The participant itself is *not* missing. `getCallInfo` reports:
+Making the engine say it takes one trick. Every site pushes the same
+`i32.const 70008`, four bytes, and neighbouring values encode to the same
+length — so a copy of the module can give each site a distinct code without
+moving anything:
 
-```json
-"participant_count": 2,
-"participants": [
-  { "is_self": false, "jid": "…@lid", "state": 2, "order_id": 2 },
-  { "is_self": true,  "jid": "…@lid", "state": 7, "order_id": 0 }
-],
-"self_participant_uuid": ""
+```sh
+# each i32.const 70008 in the function's range -> 70101, 70102, ...
+# then read which one comes back in
+#   "wa_call_start_internal, make_and_cache_offer failed: %d"
 ```
 
-So the open question is narrow: **what fills the group's cached self pointer,
-given that the self participant already exists in the list.**
+The answer is **70112**, which is **`offer.cc:485`**:
+
+```
+if (10530(ctx, 10297(arg1->[0])) == 0)  ->  70008
+
+  10297  wa_call_participant_jid_get_user_jid   (common/wa_call_participant_jid.cc)
+  10530  calls 10535(ctx, jid); null -> 0, else reads [+8]
+  10535  loads ctx->[659164] — the group — and searches it by JID
+```
+
+**Looking a participant up by JID inside the group returns nothing.** It is
+about participants after all, but about a *lookup*, not about the cached self
+pointer that `offer.cc:463` guards.
+
+What makes that odd is that the participants are there: `getCallInfo` lists two,
+one marked `is_self` with our own LID and one for the peer. And the peer JID's
+shape is not the variable — five forms (bare LID, device LID, legacy `@c.us` in
+the fifth argument, self added to the list, bare list) all fail at the same
+site.
+
+### Why the comparison fails, and the proof
+
+The two sides carry JIDs in different shapes. Read out of memory:
+
+```
+the self jid (ctx[1288], used to create)   a participant's jid (p->[4], in the group)
+  +8   len 20  "99887766554433:0@lid"        +8   len 18  "99887766554433@lid"
+  +24  len 16  "99887766554433:0"            +24  len 14  "99887766554433"
+  +48  len 14  "99887766554433"              +40  domain 5
+  +72  len 20  "99887766554433:0@lid"
+```
+
+One is a *device* jid, the other a *user* jid, and `pj_strcmp` is applied to `+8`
+of each — 20 characters against 18. It cannot match. Both hold the same number,
+but at different offsets.
+
+That is testable without finding the search key at all: patch the comparison to
+use the number instead of the raw form. In function 10284,
+
+```
+local.get 0 ; i32.const 8 ; i32.add ; local.get 1 ; i32.const 8 ; i32.add ; call 8468
+                       ^^ -> 48                                ^^ -> 24
+```
+
+`41 08` → `41 30` and `41 18`, same width, nothing moves. The pattern occurs
+twice; the one inside 10284 is the later offset.
+
+With that patch **the 70008 disappears entirely** and the call runs for minutes
+instead of seconds before hanging — it is doing transport work it never reached
+before. So the device/user divergence is the first blocker, demonstrated rather
+than argued.
+
+It is not a usable fix: it edits the module. The real fix is either to hand the
+engine JIDs in the shape it expects, or to find the setup step that converts
+device to user and never runs here. And signaling still does not go out — the
+probe reports `SIGNALING SENT: 0` with and without the patch, so more blockers
+follow.
+
+The argument chain, counted instruction by instruction:
+
+* `make_and_cache_offer`'s `arg1` is `wa_call_start_internal`'s `arg3`.
+* `wa_call_start_call` calls it with `arg0 = *(u32*)1352840` — the context, from
+  a global — and `arg3 = params->[0]`, where `params` is `wa_call_start_call`'s
+  own first argument.
+* So the JID being looked for is `params->[0]->[0]`.
+
+Note that `params` is **not** the call context, which is easy to get wrong: the
+context arrives from the global, and the byte fields `[3856]`, `[3859]`,
+`[3860]` belong to `params`.
+
+### Reading the call context
+
+`*(u32*)1352840`. The engine reaches it the same way: `getCallInfo` registers
+table slot 746 (function 1108), which calls function 10386 — seven instructions
+that open `i32.const 1352840 / i32.load`.
+
+Two things worth knowing before trusting a run:
+
+* A healthy run has `0x6d0018` there and structured data around `1352680`. A run
+  showing `0xe0c70adc` and high-entropy data died before reaching the offer, and
+  the 70008 never appears in it.
+* Whether the engine's log is real. After an incoming offer followed by an
+  outgoing call it sometimes fills with random printable bytes instead of
+  messages, which reads as "the call went quiet" when it means the opposite.
 
 ## The one tool to reach for first
 

@@ -145,7 +145,7 @@ fn main() -> anyhow::Result<()> {
     // code the engine already uses for a JID in the form it did not want.
     const PEER_LEGACY: &str = "11223344556677@c.us";
 
-    let shapes: [(&str, &str, &str, Vec<String>); 3] = [
+    let shapes: [(&str, &str, &str, Vec<String>); 5] = [
         (
             "peer only",
             PEER_LID,
@@ -163,6 +163,22 @@ fn main() -> anyhow::Result<()> {
             PEER_LID,
             PEER_LEGACY,
             vec![PEER_LID_DEVICE.to_owned()],
+        ),
+        // `offer.cc:485` fails because looking a participant up by *user* JID
+        // returns nothing — `wa_call_participant_jid_get_user_jid` strips the
+        // device before the lookup. These vary which form the peer argument
+        // takes, since that is what ends up being looked for.
+        (
+            "peer as device lid",
+            PEER_LID_DEVICE,
+            PEER_LID_DEVICE,
+            vec![PEER_LID_DEVICE.to_owned()],
+        ),
+        (
+            "peer bare, list bare",
+            PEER_LID,
+            PEER_LID,
+            vec![PEER_LID.to_owned()],
         ),
     ];
 

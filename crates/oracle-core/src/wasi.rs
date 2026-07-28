@@ -240,6 +240,15 @@ fn path_open(
     };
     let path = normalise(&String::from_utf8_lossy(&raw));
 
+    // What the guest asked for, whether or not it got it. A refusal here is
+    // invisible from the outside — the VoIP engine reports only "Failed to get
+    // voip storage dir" and carries on — so without this the host cannot tell a
+    // path it should have provided from one the guest never wanted.
+    caller.data().log(format!(
+        "wasi path_open {path:?} (create={})",
+        oflags & O_CREAT != 0
+    ));
+
     let state = caller.data_mut();
     let exists = state.wasi.files.contains_key(&path);
     if !exists {

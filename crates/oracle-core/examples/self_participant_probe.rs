@@ -100,7 +100,7 @@ fn find_context(runtime: &mut Runtime, call_id: &str) -> Vec<(u32, u32, u32, u32
                 .read(group, 16)
                 .map(|b| b.iter().any(|&x| x != 0) && b.iter().any(|&x| !(0x20..0x7f).contains(&x)))
                 .unwrap_or(false);
-            if group > 0x10000 && group < 0x4000000 && group % 4 == 0 && structured {
+            if group > 0x10000 && group < 0x4000000 && group.is_multiple_of(4) && structured {
                 let Ok(bytes) = runtime.read(group + SELF_IN_GROUP, 4) else {
                     continue;
                 };
@@ -180,6 +180,44 @@ fn main() -> anyhow::Result<()> {
     )?;
     runtime.refuel();
     dump_globals(&mut runtime, "after init");
+    // Same accessor, before any call: distinguishes a field the call populates
+    // from one that is simply always there.
+    if let Ok(b) = runtime.read(1_352_840, 4) {
+        let ctx = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        println!("after init: context = {ctx:#x}");
+        if ctx > 0x10000 {
+            sample(&mut runtime, ctx, "after init");
+        }
+    }
+
+    // Force the guard at offer.cc:430 open. It fails when `arg2 == 0` and the
+    // byte at `context + 662166` is zero; `make_and_cache_offer` only ever
+    // reads that byte, so whatever sets it lives elsewhere and never runs here.
+    // Setting it directly says whether that guard is really what stops the
+    // offer, and what the engine does once past it.
+    if let Ok(b) = runtime.read(1_352_840, 4) {
+        let ctx = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        if ctx > 0x10000 {
+            let before = runtime.read(ctx + 662_166, 1).ok();
+            let _ = runtime.write_bytes_at(ctx + 662_166, &[1]);
+            let after = runtime.read(ctx + 662_166, 1).ok();
+            println!("forced ctx[662166]: {before:?} -> {after:?}");
+
+            // The guard's *other* term. `wa_call_start_call` calls
+            // `wa_call_start_internal` with `(ctx, ctx+248, ctx[3859],
+            // ctx[3860], ctx[3856], 0, 0, 0)`, and its parameter 4 is what
+            // reaches `make_and_cache_offer` as `arg2` — so `arg2` is the byte
+            // at `context + 3856`. Either term being non-zero opens the guard.
+            for probe in [3856u32, 3859, 3860] {
+                println!("  ctx[{probe}] = {:?}", runtime.read(ctx + probe, 1).ok());
+            }
+            let _ = runtime.write_bytes_at(ctx + 3856, &[1]);
+            println!(
+                "  forced ctx[3856] -> {:?}",
+                runtime.read(ctx + 3856, 1).ok()
+            );
+        }
+    }
 
     let mark = runtime.engine_log().len();
     let outcome = runtime.call_embind(
@@ -188,16 +226,417 @@ fn main() -> anyhow::Result<()> {
             Value::Str(PEER_LID.into()),
             Value::StringList(vec![PEER_LID_DEVICE.to_owned()]),
             Value::Str("0011223344556677".into()),
+            // Audio only. A video call was tried, on the theory that `arg2` of
+            // `make_and_cache_offer` — local 4 at the call site, "length or
+            // count", with `has_video: 0` beside it in the log — is the video
+            // flag, which would open the guard at offer.cc:430. Measured over
+            // four runs it makes no difference: 70008 still appears in three of
+            // them, all with a healthy context.
             Value::Bool(false),
             Value::Str(PEER_LID.into()),
             Value::Bool(false),
             Value::Bytes(Vec::new()),
         ],
     );
+    // Read the context slot at three moments, to localise in time when it
+    // stops holding a pointer: while the call was running, or afterwards while
+    // the worker threads drain.
+    let peek = |r: &Runtime, when: &str| {
+        if let Ok(b) = r.read(1_352_840, 4) {
+            println!(
+                "  slot@{when} = {:#x}",
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            );
+        }
+    };
+    // The whole static neighbourhood, not just the one slot: 1352840 sits 160
+    // bytes past the singleton at 1352680 and 32 past the init guard at
+    // 1352808, so a write running off the end of either would land on it.
+    // Comparing the region before and after shows whether the context pointer
+    // is singled out or caught in a wider overwrite.
+    let region = |r: &Runtime, when: &str| {
+        if let Ok(b) = r.read(1_352_680, 224) {
+            let words: Vec<String> = b
+                .chunks_exact(4)
+                .enumerate()
+                .filter(|(_, w)| w.iter().any(|&x| x != 0))
+                .map(|(i, w)| {
+                    format!(
+                        "+{}={:#x}",
+                        i * 4,
+                        u32::from_le_bytes([w[0], w[1], w[2], w[3]])
+                    )
+                })
+                .collect();
+            println!("  region@{when}: {}", words.join(" "));
+        }
+    };
+    region(&runtime, "before call");
+    peek(&runtime, "right after startVoipCall");
+    region(&runtime, "after call");
+    // `10535` is `get_participant` (call_membership.cc). It skips its whole
+    // search loop when `group->[552]` is zero and then returns null — which is
+    // exactly what `offer.cc:485` treats as "participant not found". Measure it.
+    if let Ok(b) = runtime.read(1_352_840, 4) {
+        let ctx = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        if ctx > 0x10000
+            && let Ok(g) = runtime.read(ctx + GROUP_IN_CALL, 4)
+        {
+            let group = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+            if group > 0x10000 {
+                println!(
+                    "  group {group:#x}: [552] = {:?}  (zero means get_participant never searches)",
+                    runtime.read(group + 552, 1).ok()
+                );
+                // `wa_call_group_get_participant(group, i)` is an array accessor:
+                // base `group+44`, capacity 127, 4-byte elements, then a load of
+                // `[0]`. So participant i is `*(group + 44 + i*4)`.
+                //
+                // The search compares `p->[4]` and only when `p->[0]` is
+                // non-zero — those two words decide whether the comparison even
+                // runs, and against what.
+                for i in 0..2u32 {
+                    let Ok(w) = runtime.read(group + 44 + i * 4, 4) else {
+                        continue;
+                    };
+                    let p = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                    if p < 0x10000 {
+                        println!("  participant[{i}] = {p:#x} (not a pointer)");
+                        continue;
+                    }
+                    let field = |off: u32| {
+                        runtime
+                            .read(p + off, 4)
+                            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .unwrap_or(u32::MAX)
+                    };
+                    let jid = field(4);
+                    let text = runtime
+                        .read(jid.wrapping_add(8), 40)
+                        .map(|b| {
+                            b.iter()
+                                .take_while(|&&c| c != 0)
+                                .map(|&c| {
+                                    if (0x20..0x7f).contains(&c) {
+                                        c as char
+                                    } else {
+                                        '.'
+                                    }
+                                })
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "  participant[{i}] = {p:#x}  [0]={:#x}  [4]={jid:#x}  jid+8 -> {text:?}",
+                        field(0)
+                    );
+                    // Raw bytes of the jid struct `10284` compares. It tests
+                    // `a+8` against `b+8`, so the shape of that region is what
+                    // decides a match.
+                    if let Ok(raw) = runtime.read(jid, 48) {
+                        let hex: Vec<String> = raw.iter().map(|b| format!("{b:02x}")).collect();
+                        println!("      jid raw: {}", hex.join(" "));
+                    }
+                }
+            }
+        }
+    }
+    // The JID the offer path looks up. `make_and_cache_offer` reads `arg1->[0]`
+    // and hands it to `wa_call_participant_jid_get_user_jid`; `arg1` is
+    // `wa_call_start_internal`'s arg3, and the only pointer-shaped arguments
+    // `wa_call_start_call` builds are `ctx+180` and `ctx+248`. Dump both.
+    if let Ok(b) = runtime.read(1_352_840, 4) {
+        let ctx = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        if ctx > 0x10000 {
+            for base in [180u32, 248] {
+                let Ok(w) = runtime.read(ctx + base, 4) else {
+                    continue;
+                };
+                let ptr = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                let text = runtime
+                    .read(ptr, 48)
+                    .map(|bytes| {
+                        bytes
+                            .iter()
+                            .take_while(|&&c| c != 0)
+                            .map(|&c| {
+                                if (0x20..0x7f).contains(&c) {
+                                    c as char
+                                } else {
+                                    '.'
+                                }
+                            })
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                println!("  ctx+{base}: [0]={ptr:#x} -> {text:?}");
+            }
+        }
+    }
+    // The OTHER 70008 site. `make_and_cache_offer` has two: offer.cc:463 checks
+    // the self participant, and offer.cc:430 fails when `arg2 == 0` and the
+    // byte at `arg0 + 662166` is zero. The self-participant reading has been
+    // assumed all along; this measures the alternative.
+    if let Ok(b) = runtime.read(1_352_840, 4) {
+        let ctx = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        if ctx > 0x10000
+            && let Ok(flag) = runtime.read(ctx + 662_166, 1)
+        {
+            println!("  offer.cc:430 guard — ctx[662166] = {:#x}", flag[0]);
+        }
+    }
     runtime.refuel();
+    peek(&runtime, "after refuel");
     runtime.settle(std::time::Duration::from_secs(5));
+    peek(&runtime, "after settle");
     println!("startVoipCall -> {outcome:?}");
+    // The whole point: did anything reach the wire?
+    println!(
+        "SIGNALING SENT: {}  |  call events: {}",
+        runtime.all_calls_to("env::sendSignalingXMPP_js_sync").len(),
+        runtime.all_calls_to("env::on_call_event_js_sync").len()
+    );
     dump_globals(&mut runtime, "after startVoipCall");
+
+    // Static addresses identified from the call path: the singleton guarded by
+    // `10598`, its init guard, the lock `10399` wraps, and the two function
+    // pointers `8669` reads. If the call context is reachable at all without
+    // scanning, it is from one of these.
+    // Find the group by who points at the self participant, rather than by
+    // guessing a base. The participant struct must hold our own LID, so scan
+    // for that, then scan for any word equal to a hit: `group[592]` is defined
+    // to be that pointer, so an address A holding it implies `group = A - 592`.
+    //
+    // If nothing anywhere points at the participant from offset 592, then the
+    // cache really is unset everywhere — which is the claim under test.
+    // Decisive form: look for *any* base B where `B+659164` holds a pointer G
+    // and `G+592` is non-null. That is exactly the shape the offer path
+    // demands, so if no such B exists anywhere in memory, the self participant
+    // cache is unset everywhere — which is the claim, tested directly instead
+    // of through a base guessed from the call id.
+    println!("--- any group with a non-null self participant? ---");
+    {
+        let mut whole = Vec::new();
+        let mut at = 0u32;
+        while at < (16 << 20) {
+            let Ok(block) = runtime.read(at, 1 << 20) else {
+                break;
+            };
+            whole.extend_from_slice(&block);
+            at += 1 << 20;
+        }
+        let word_at = |a: usize| -> Option<u32> {
+            whole
+                .get(a..a + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let plausible =
+            |v: u32| v > 0x10000 && (v as usize) + 596 < whole.len() && v.is_multiple_of(4);
+
+        let mut found = 0usize;
+        for base in (0..whole.len().saturating_sub(659_168)).step_by(4) {
+            let Some(group) = word_at(base + 659_164) else {
+                continue;
+            };
+            if !plausible(group) {
+                continue;
+            }
+            let Some(selfp) = word_at(group as usize + 592) else {
+                continue;
+            };
+            if selfp != 0 && plausible(selfp) {
+                // The shape alone is worthless — memory is full of structs with
+                // a non-null word 592 bytes in, and every candidate found that
+                // way so far has been one. A real self participant carries our
+                // own LID, so require that before reporting anything.
+                let window = whole
+                    .get(selfp as usize..(selfp as usize + 512).min(whole.len()))
+                    .unwrap_or(&[]);
+                if !window.windows(14).any(|w| w == b"99887766554433") {
+                    continue;
+                }
+                println!(
+                    "  base {:#x} -> group {group:#x} -> self {selfp:#x}  (carries our LID)",
+                    base as u32
+                );
+                found += 1;
+            }
+        }
+        if found == 0 {
+            println!("  none — no group anywhere has a non-null self participant");
+        }
+    }
+
+    // The call context, from the engine's own accessor rather than a guess.
+    // `getCallInfo` (embind) is function 1108, which calls 10386, which is
+    // seven instructions long and opens with `i32.const 1352840 / i32.load` —
+    // so the context pointer is stored *at* 1352840, and this is how the engine
+    // itself reaches it.
+    println!("--- context via the engine's own accessor ---");
+    {
+        const CONTEXT_SLOT: u32 = 1_352_840;
+        match runtime
+            .read(CONTEXT_SLOT, 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        {
+            Ok(ctx) => {
+                println!("  *[{CONTEXT_SLOT}] = {ctx:#x}");
+                if ctx > 0x10000 {
+                    sample(&mut runtime, ctx, "context");
+                    if let Ok(b) = runtime.read(ctx + GROUP_IN_CALL, 4) {
+                        let group = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        if let Ok(p) = runtime.read(group + SELF_IN_GROUP, 4) {
+                            let selfp = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                            println!(
+                                "  => group {group:#x}, group[592] = {selfp:#x}  {}",
+                                if selfp == 0 {
+                                    "NULL — this is the blocker"
+                                } else {
+                                    "SET"
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => println!("  unreadable: {e}"),
+        }
+    }
+
+    // Every JID string the engine holds. The key the lookup searches for must
+    // be one of them, and the two the participants carry are known — so a third
+    // distinct one is the candidate for what is being searched.
+    // `startVoipCall` builds `params` and sets `params->[0] = local8`, where
+    // local8 comes from `global.get 10` — measured as 0x18. If that really is
+    // the base, the searched JID is reachable from address 0x18.
+    // `call->[1288]` is the JID `reset_group_and_self_participant` hands to
+    // `wa_call_group_create_participant` when it creates the *self*
+    // participant — and the engine reports it failing with "participant
+    // 6677@lid already exists", which is the peer. Read it.
+    println!("--- call->[1288], the jid used to create SELF ---");
+    if let Ok(b) = runtime.read(1_352_840, 4) {
+        let ctx = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        if ctx > 0x10000
+            && let Ok(w) = runtime.read(ctx + 1288, 4)
+        {
+            let jid = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            println!("  ctx[1288] = {jid:#x}");
+            // Same pj_str_t layout as the participants: {ptr,len} at +8.
+            if jid > 0x10000
+                && let Ok(raw) = runtime.read(jid, 96)
+            {
+                let word =
+                    |o: usize| u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+                // Every {ptr,len} pair in the struct, not just the two known
+                // ones: if any field holds the 18-char user form, then the
+                // conversion exists and `10297` is reading the wrong one.
+                for off in (0..88).step_by(8) {
+                    let (ptr, len) = (word(off), word(off + 8));
+                    if ptr > 0x10000 && (1..=64).contains(&len) {
+                        let text = runtime
+                            .read(ptr, len)
+                            .map(|t| String::from_utf8_lossy(&t).to_string())
+                            .unwrap_or_default();
+                        println!("    +{off}: len={len} {text:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    println!("--- low memory around 0x18 ---");
+    if let Ok(b) = runtime.read(0, 64) {
+        for (i, w) in b.chunks_exact(4).enumerate() {
+            let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            if v != 0 {
+                println!("  [{}] = {v:#x}", i * 4);
+            }
+        }
+    }
+
+    println!("--- distinct JID strings in memory ---");
+    {
+        let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut at = 0u32;
+        while at < (16 << 20) {
+            let Ok(block) = runtime.read(at, 1 << 20) else {
+                break;
+            };
+            for suffix in [
+                b"@lid".as_slice(),
+                b"@s.whatsapp.net".as_slice(),
+                b"@c.us".as_slice(),
+            ] {
+                for (off, w) in block.windows(suffix.len()).enumerate() {
+                    if w != suffix {
+                        continue;
+                    }
+                    // Walk back over the local part.
+                    let mut start = off;
+                    while start > 0 {
+                        let c = block[start - 1];
+                        if c.is_ascii_digit() || c == b':' || c == b'.' || c == b'-' {
+                            start -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if start == off {
+                        continue;
+                    }
+                    let text =
+                        String::from_utf8_lossy(&block[start..off + suffix.len()]).to_string();
+                    *seen.entry(text).or_default() += 1;
+                }
+            }
+            at += (1 << 20) - 32;
+        }
+        for (jid, count) in seen.iter().take(20) {
+            println!("  {jid}  x{count}");
+        }
+    }
+
+    println!("--- static candidates ---");
+    for addr in [1_352_680u32, 1_352_808, 1_354_760, 1_263_140, 1_263_144] {
+        let word = runtime
+            .read(addr, 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        match word {
+            Ok(value) => {
+                let plausible = value > 0x10000 && value < 0x4000000;
+                println!(
+                    "  [{addr}] = {value:#x}{}",
+                    if plausible {
+                        "  (in-memory pointer)"
+                    } else {
+                        ""
+                    }
+                );
+                // If it is a pointer, does it look like a call context?
+                if plausible && let Ok(b) = runtime.read(value + GROUP_IN_CALL, 4) {
+                    let group = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    if group > 0x10000 && group < 0x4000000 {
+                        println!("      +659164 -> {group:#x}  <-- candidate context!");
+                    }
+                }
+            }
+            Err(_) => println!("  [{addr}] unreadable"),
+        }
+        // A statically-initialised singleton lives *at* its address rather than
+        // being pointed to by it, so the address itself is a candidate base.
+        if let Ok(b) = runtime.read(addr + GROUP_IN_CALL, 4) {
+            let group = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            if group > 0x10000 && group < 0x4000000 {
+                let selfp = runtime
+                    .read(group + SELF_IN_GROUP, 4)
+                    .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+                    .unwrap_or(u32::MAX);
+                println!(
+                    "      as base: +659164 -> group {group:#x}, group[592] = {selfp:#x}  <-- CANDIDATE"
+                );
+            }
+        }
+    }
 
     println!("--- scanning for the call context ---");
     for (base, group, selfp, count, back) in find_context(&mut runtime, "0011223344556677") {
