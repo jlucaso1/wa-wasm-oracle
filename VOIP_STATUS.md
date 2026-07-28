@@ -425,9 +425,15 @@ calls; move the pointer and it gets further, reaches an index only the main
 thread's table has, and traps — which would make moving the stack the *trigger*
 and the stale table the *cause*. Every table measures 9291 entries at thread
 start — and the main thread's still measures 9291 at the end, so **nothing grows
-one**. The part of the mechanism that rested on `table.grow` is refuted; what
-survives is narrower, since thousands of `table.set` can change entries without
-changing the size, and each instance changes only its own.
+one**. And the occupancy does not move either: 9290 slots
+are filled right after the constructors and 9290 at the end, so no `table.set`
+fills an empty slot or clears one. **The mechanism is refuted.** All that
+survives is the narrow case of a slot whose function is replaced by another,
+which changes neither count — and nothing observed suggests it happens.
+
+The opcodes are present in the module and simply are not reached on this path,
+which is worth remembering: counting opcodes says what a module *can* do, never
+what it does.
 
 Testing it means giving the workers the main thread's table, which wasmtime does
 not make easy: a `Func` belongs to its store, so entries cannot simply be copied

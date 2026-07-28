@@ -317,6 +317,28 @@ impl Runtime {
     /// `table.grow`, `table.fill`, `table.set` — so comparing this against what
     /// a worker reports says whether their tables have drifted apart, and a
     /// worker calling an index only this one has would trap.
+    /// How many of this instance's table slots are filled.
+    ///
+    /// The size alone does not say whether the table changed: `table.set` can
+    /// replace an entry or clear one without growing anything. Counting the
+    /// occupied slots before and after a run says whether the module mutates
+    /// its table at all, which decides whether per-instance tables can drift.
+    pub fn table_filled(&mut self) -> Option<u64> {
+        let name = self.store.data().shared.table_export.get()?.clone();
+        let Some(Extern::Table(table)) = self.instance.get_export(&mut self.store, &name) else {
+            return None;
+        };
+        let size = table.size(&self.store);
+        let filled = (0..size)
+            .filter(|index| {
+                table
+                    .get(&mut self.store, *index)
+                    .is_some_and(|entry| !entry.is_null())
+            })
+            .count();
+        Some(filled as u64)
+    }
+
     pub fn table_size(&mut self) -> Option<u64> {
         let name = self.store.data().shared.table_export.get()?.clone();
         match self.instance.get_export(&mut self.store, &name) {

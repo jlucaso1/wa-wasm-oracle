@@ -168,6 +168,10 @@ fn main() -> anyhow::Result<()> {
     runtime.run_ctors()?;
     runtime.attach_log_ring(4 << 20)?;
 
+    println!(
+        "table right after ctors: filled {:?}",
+        runtime.table_filled()
+    );
     dump_globals(&mut runtime, "before init");
 
     runtime.call_embind(
@@ -567,7 +571,11 @@ fn main() -> anyhow::Result<()> {
         println!("  {}", line.trim());
     }
 
-    println!("main thread table size: {:?}", runtime.table_size());
+    println!(
+        "main thread table: size {:?} filled {:?}",
+        runtime.table_size(),
+        runtime.table_filled()
+    );
 
     println!("--- low memory around 0x18 ---");
     if let Ok(b) = runtime.read(0, 64) {
