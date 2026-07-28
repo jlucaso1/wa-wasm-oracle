@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Wasmtime and Cranelift dominate the build; a failure is almost never in the
+  # last crate compiled, so the full output is worth having.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt, clippy, unused deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all --tests -- -D warnings
+
+      - name: unused dependencies
+        uses: bnjbvr/cargo-machete@main
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: wa-wasm-oracle
+
+      # The captured modules live in the whatsapp-rust checkout, and the tests
+      # look for it as a sibling. Without it every test skips — which passes,
+      # and proves nothing. The step below refuses that outcome.
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: oxidezap/whatsapp-rust
+          path: whatsapp-rust
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wa-wasm-oracle
+
+      - name: build
+        working-directory: wa-wasm-oracle
+        run: cargo build --release --all-targets
+
+      - name: test
+        working-directory: wa-wasm-oracle
+        run: cargo test --release -- --nocapture 2>&1 | tee test-output.txt
+
+      # A skipped test reports success. When the capture is present, a skip
+      # means the tests silently stopped covering the thing they exist for, so
+      # it is treated as a failure rather than as a warning.
+      - name: reject silent skips
+        working-directory: wa-wasm-oracle
+        run: |
+          if [ -d ../whatsapp-rust/docs/captured-js/wasm ]; then
+            if grep -q "skipping:" test-output.txt; then
+              echo "Tests skipped while the capture was available:"
+              grep "skipping:" test-output.txt
+              exit 1
+            fi
+          else
+            echo "::warning::capture unavailable, tests ran in skip mode"
+          fi
+
+  # The signaling tests bring up PJSIP's worker pool: reliable under host-driven
+  # scheduling, but slow enough (~4 min) to keep out of the main run. Blocking,
+  # because they now either pass or have found something.
+  signaling:
+    name: signaling (slow)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: wa-wasm-oracle
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: oxidezap/whatsapp-rust
+          path: whatsapp-rust
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wa-wasm-oracle
+
+      - working-directory: wa-wasm-oracle
+        run: cargo test --release --test signaling -- --ignored --test-threads 1
+
+  # The threaded tests bring up PJSIP's worker pool and hold a serialisation
+  # lock, so they are slow but not flaky. Run repeatedly: the engine has a
+  # startup race the harness can narrow and not close, and a single green run
+  # would not show a retry budget quietly running out.
+  threading:
+    name: threads (repeated)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: wa-wasm-oracle
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: oxidezap/whatsapp-rust
+          path: whatsapp-rust
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wa-wasm-oracle
+
+      - working-directory: wa-wasm-oracle
+        run: |
+          for attempt in 1 2 3; do
+            echo "--- run $attempt ---"
+            cargo test --release --test threading || exit 1
+          done

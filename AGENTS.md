@@ -1,0 +1,156 @@
+# wa-wasm-oracle
+
+Runs WhatsApp Web's shipped wasm modules and calls into them. Read `README.md`
+first — it holds the module map, the recovered VoIP API, and the known limits.
+
+## Build & verify
+
+```sh
+cargo fmt --all
+cargo clippy --all --tests --release -- -D warnings
+cargo test --release
+cargo machete                 # no unused dependencies
+```
+
+Always `--release` for anything that executes a module. In a debug build
+Cranelift compiles the 9.3 MiB VoIP module so slowly that runs look hung.
+
+Tests exercise the real captures and skip when the capture directory is missing.
+A skipped run is not a passing run: check for `skipping:` in
+`cargo test --release -- --nocapture` before trusting green.
+
+## Where the modules come from
+
+`docs/captured-js/wasm/` in the whatsapp-rust checkout. Do not copy them here —
+a second copy drifts from the capture the protocol docs refer to. `WA_WASM_DIR`
+overrides the lookup.
+
+## Ground rules
+
+- **A stub that returns zero is a hypothesis, not an implementation.** The table
+  in `README.md` lists what each zeroed stub actually cost: busy-waits in the
+  millions, skipped static initialisers, threads that never ran. When a module
+  misbehaves, read `hot_calls()` before suspecting the module.
+- **Never look up an export without reporting a miss.** Go through
+  `exports.rs`. A `let Some(..) = get_export(..) else { return; }` cost a day:
+  the module exports `_emscripten_thread_init`, the host asked for
+  `__emscripten_thread_init`, and the silent miss left the main thread
+  unregistered — so every call a worker queued for it was dropped, and the
+  symptom surfaced thousands of instructions away. A miss now names the near
+  misses, normalising leading underscores and case.
+- **Determinism is the product.** Anything that would vary between runs — clocks,
+  randomness, filesystem — must be replaced by something reproducible. A
+  comparison against whatsapp-rust is worthless if the oracle's own output
+  drifts.
+- **Unsupported is an error, never a guess.** `call.rs` refuses types it cannot
+  marshal, and `wasi.rs` returns `ENOSYS` rather than success for calls it does
+  not implement. A wrong answer from an oracle is worse than no answer.
+- **Derive host functions from the module's declared signature.** Emscripten
+  changes these between releases — `_embind_register_bigint` takes five arguments
+  in one capture and seven in another — so a fixed `func_wrap` breaks on the next
+  module. `embind.rs`, `cxa.rs` and `wasi.rs` all build from `import.ty()`.
+- **The main thread must not be able to block in wasm.** Pass
+  `can_block = 0` to `__emscripten_thread_init` — the value emscripten itself
+  uses on the web (`canBlock: !ENVIRONMENT_IS_WEB`). With 1, a waiting main
+  thread takes `memory.atomic.wait32`, which blocks *inside* wasm with no host
+  call: it holds its scheduler turn while blocked and the thread that would
+  notify it never gets one. That was the "startup race", and it was the
+  harness's, not the engine's — `initVoipStack` trapped about one attempt in
+  six, and no amount of retrying would have fixed it. With 0 the main thread
+  takes emscripten's busy-wait, which calls `_emscripten_yield` each time round:
+  a host call, so the turn is yielded and the proxying queue drains.
+  `startup_is_reliable_and_never_forces_a_turn` is the guard; `forced_turns()`
+  must stay zero.
+- **Every test that starts an engine takes both locks.** `threaded_guard()`
+  serialises within a test binary; `common::engine_lock()` serialises *across*
+  them, because cargo runs the binaries in parallel and `threading`,
+  `signaling` and `host_environment` all bring up PJSIP worker pools. Two pools
+  competing for cores miss their own deadlines, and that surfaces as an
+  unrelated-looking failure — `initVoipStack` trapping inside a test that is not
+  about startup. The cross-binary lock is a TCP bind rather than a lock file:
+  the OS releases a port when the process dies, so a killed test cannot wedge
+  every later run.
+- **Sweep, don't spot-check.** The `convertFixed32BitToFloat` model was wrong in
+  a way that only showed up at `n >= 25`; a two-point test would have shipped it.
+- **Inspection must not compile.** `inspect.rs` is `wasmparser` only, and
+  resolves signatures by hand. Reaching for a runtime there trades 8 ms for
+  seconds to learn something already present in the bytes.
+- **Keep the dependency surface honest.** wasmtime is `default-features = false`
+  with an explicit list; adding a feature means something needs it. Run
+  `cargo machete` before calling work done.
+- **Identify by data segments, not `strings(1)`.** Dense wasm opcodes decode as
+  printable ASCII by accident; the `strings` subcommand scans data segments only.
+- **No real PII.** Test JIDs use fictitious `1555...` numbers.
+- `unsafe` is denied workspace-wide. The shared-memory accessors in `runtime.rs`
+  carry `#[allow]` plus a SAFETY note; do not add more without one.
+
+## Where things live
+
+Host environment, in the order a module exercises it:
+
+- `emscripten.rs` — clock, PRNG, `invoke_*` trampolines, thread refusal
+- `cxa.rs` — C++ throw/catch, exception messages via `__get_exception_message`
+- `wasi.rs` — preview-1 subset over an in-memory filesystem
+- `embind.rs` — recovers the registered API from the `_embind_register_*` calls
+- `call.rs` — marshals C++ types and calls through the invoker table
+
+## Two host bugs worth not repeating
+
+- **The guest memory is not always exported as `memory`.** mozjpeg exports it as
+  `x`; a host looking only for the conventional name cannot read that module at
+  all, and every read fails in a way that reads as "the module is broken". The
+  name now comes from the module's export list.
+- **A dropped `Runtime` used to leave its workers running.** A guest worker loop
+  only ends when its fuel runs out, so finished tests kept burning CPU. `Drop`
+  signals a shutdown that every host call checks.
+
+## The signaling tests are slow, not flaky
+
+They bring up PJSIP's worker pool and take about four minutes, so they are
+`#[ignore]`d and run on their own:
+
+```sh
+cargo test --release --test signaling -- --ignored --test-threads 1
+```
+
+They used to be genuinely unreliable, and what fixed it is worth knowing:
+
+- **Startup raced about one time in nine.** Measured with
+  `examples/init_stress.rs`: `initVoipStack` finishes in ~5 ms, and the trap
+  landed with 99.6% of the fuel untouched and the media init already logged as
+  complete — two real threads reaching the same state. `schedule.rs` now runs
+  one guest thread at a time, which took it to roughly 1 in 40; six retries
+  cover the rest.
+- **Offer handling is asynchronous.** The call returning says nothing about the
+  event thread. Wait for the log to grow and go quiet, never for a fixed time.
+
+Also worth remembering: **substring matches on log lines lie.**
+`handleIncomingSignalingOffer from platform ...` contains `Offer from`, so a
+test looking for the call-stack banner passed for a stanza that never parsed.
+
+## Meeting a module you have never seen
+
+`oracle abi` is the way in, and it is deliberately general — it reads bytecode,
+so it works on captures that do not exist yet. The order that has paid off:
+
+1. `oracle inspect <id>` — what it imports says which host environment it wants
+   (`env::_embind_*` → emscripten/embind; `wasi_snapshot_preview1` → a WASI
+   command; a shared memory → it expects threads).
+2. `oracle strings <id>` — data segments identify the module. Never `strings(1)`
+   on the whole file.
+3. `oracle embind <id>` for an emscripten module; `oracle abi <id>` for anything
+   stripped.
+4. If `abi` reports a trampoline, read the vtable slot out of a live object and
+   follow it with `--slot`.
+
+## Open work
+
+1. **`_start` on the media modules exits 71** before reading `argv`. Their
+   exported functions are callable directly, so this blocks nothing, but the
+   cause is unconfirmed — likely the file-handling callbacks
+   (`setFileHandlingCallback`).
+2. **Drive a full call flow**: `initVoipStack` then
+   `handleIncomingSignalingOffer`, and compare the recorded
+   `sendSignalingXMPP_js_sync` payloads against what whatsapp-rust emits. The
+   marshalling this needs is done; what is missing is a realistic offer payload.
+3. **Non-vector embind classes**, if a module ever registers one that matters.

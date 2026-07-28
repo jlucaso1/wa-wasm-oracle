@@ -1,0 +1,25 @@
+[package]
+name = "oracle-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Loads and inspects WhatsApp Web's WebAssembly modules as an executable oracle"
+
+[dependencies]
+anyhow = { workspace = true }
+wasmparser = { workspace = true }
+wasmtime = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+base64 = "0.23.0"
+flate2 = "1.1.9"
+# Used only to build wire-format stanzas for the signaling tests: the oracle is
+# fed the same bytes whatsapp-rust would emit. `simd` needs nightly, and this is
+# not a hot path.
+wacore-binary = { path = "../../../whatsapp-rust/wacore/binary", default-features = false }
+wasmtime.workspace = true

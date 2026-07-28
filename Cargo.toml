@@ -1,0 +1,43 @@
+[workspace]
+members = ["crates/oracle-core", "crates/oracle-cli"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+oracle-core = { path = "crates/oracle-core" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# Static inspection: sections, signatures, custom sections. Nothing here
+# compiles a module, which is what keeps `oracle inspect` instant on a 9 MB file.
+wasmparser = { version = "0.254", default-features = false, features = ["std", "validate"] }
+# Execution. Trimmed hard: the oracle runs plain core-wasm modules from disk, so
+# the component model, GC, async, the Winch backend, debug tooling and the WAT
+# parser are all dead weight it would otherwise compile and link.
+wasmtime = { version = "41.0.4", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "std",
+    "threads",
+    "parallel-compilation",
+    # Caches compiled modules on disk. The oracle recompiles the same 9 MB
+    # module on every run and every test; without this that dominates the clock.
+    "cache",
+    # Wasm backtraces name real functions when the module kept its name section,
+    # which is how the exit-71 panic was traced back to a failing random_get.
+    "addr2line",
+    "demangle",
+] }
+
+[workspace.lints.rust]
+# Relaxed from forbid: reading wasmtime shared memory requires unsafe. Each site
+# carries a SAFETY note explaining why no concurrent writer exists.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
