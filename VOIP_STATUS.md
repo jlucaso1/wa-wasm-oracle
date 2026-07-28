@@ -388,6 +388,21 @@ means something in how the module is driven is incompatible with moving the
 stack pointer after instantiation. Do not spend more attempts on that direction
 without a new hypothesis.
 
+**The sharpest statement of the blocker, from a discriminator worth keeping.**
+Running `emscripten_stack_init` on a worker's instance and then
+`emscripten_stack_set_limits(top, end)` with the pthread's own `+52/+56`, but
+*not* `stackRestore`, gives **202 lines and 0-2 traps** — healthy. Adding the
+`stackRestore` gives 24 lines and 11 traps. So the bounds are accepted and the
+region is right; **it is assigning the stack pointer that breaks**, and ordering
+does not save it: installing the whole thing before `__emscripten_thread_init`
+and `_emscripten_tls_init` fails identically.
+
+Two more facts from the same round. A worker instance never runs
+`emscripten_stack_init`, so its bounds globals read **0/0** — nothing is checked
+there by default. And running it aims them at `0x14cf60..0x24cf60`, the module's
+static 64 KiB stack, which is the main thread's; that 64 KiB also matches the
+`0x10000` at `+56`, which confirms those offsets really are {top, size}.
+
 One tempting hypothesis is already eliminated: that the stack pointer is an
 *imported* global and therefore shared between instances, which would explain
 both the identical readings and why writing it pulls the stack out from under a
