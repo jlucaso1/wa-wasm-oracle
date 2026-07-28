@@ -413,10 +413,22 @@ each with its own globals — states that **the memory and the table are shared*
 `threads.rs` here states the opposite: each instance builds its own table from
 the element segments, on the grounds that they all initialise identically. That
 holds for static function pointers and stops holding the moment anything is
-registered at runtime, which embind does constantly. Whether it bears on the
-stack pointer is unknown, but a harness whose threads disagree about what a
-table index means is the kind of mismatch that produces symptoms like this
-one.
+registered at runtime — and this module does exactly that: **16 `table.grow`,
+28 `table.fill`, 7 `table.copy` and thousands of `table.set`**. Each instance
+mutates its own copy, so the main thread's table and the workers' diverge as
+soon as anything registers a function. "They all initialise identically" is only
+true at t=0.
+
+That suggests one explanation for the whole symptom. With its stack pointer at
+the initial value a worker parks early in a futex and never makes those indirect
+calls; move the pointer and it gets further, reaches an index only the main
+thread's table has, and traps — which would make moving the stack the *trigger*
+and the stale table the *cause*. Every table measures 9291 entries at thread
+start, so any divergence is later.
+
+Testing it means giving the workers the main thread's table, which wasmtime does
+not make easy: a `Func` belongs to its store, so entries cannot simply be copied
+across.
 
 **The earlier discriminator, still worth keeping.**
 Running `emscripten_stack_init` on a worker's instance and then
