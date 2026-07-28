@@ -68,6 +68,25 @@ fn engine(bytes: &[u8]) -> anyhow::Result<Runtime> {
     );
     runtime.write_bytes_at(ASSERT_LOG_ENABLE, &[1])?;
 
+    // Same lesson one level up: that gate only governs 8502. Ordinary lines go
+    // through a threshold instead, which admits level 3 while the lines a
+    // subsystem writes on *success* are level 4. Leaving it alone makes a
+    // function that completed look like a function that gave up.
+    println!("engine log level was {:?}", runtime.set_engine_log_level(9));
+
+    // Not done here, and worth knowing why: the soft-assert path needs a *second*
+    // thing, an indirect call through a slot at 1351212 that nothing fills, so
+    // every assert increments a counter and emits nothing. Whole exit paths in
+    // `wa_call_group_create_participant` are invisible for that reason.
+    //
+    // Pointing it at slot 3770 — a three-argument logger, the same arity the
+    // callback is invoked with — does not work: three runs came back at 94
+    // engine-log lines each against a ~200-line baseline, deterministically
+    // worse, with no assert text to show for it. Matching arity is not matching
+    // meaning. Anything here has to be a function that treats its arguments as
+    // `(file, function, line)`, and the callback also only fires for the *first*
+    // assert of each severity, so it cannot enumerate exit paths anyway.
+
     let init_mark = runtime.engine_log().len();
     let init = runtime.call_embind(
         "initVoipStack",

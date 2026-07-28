@@ -231,3 +231,26 @@ fn the_call_entry_points_take_the_arguments_this_build_declares() {
         "startVoipCall takes seven arguments here; meowmeow's build takes eight"
     );
 }
+
+/// What the engine will log, before anything asks it to log more.
+///
+/// Every line is gated by one threshold compare, and the wrappers pick the
+/// level: 3 for an ordinary line, 4 for the one a subsystem writes when it
+/// *finishes*. Whether a missing line is evidence depends entirely on this
+/// number — below 4 it says nothing, at 4 it means the code did not run. That
+/// distinction decided a diagnosis here, so it is pinned rather than assumed.
+#[test]
+fn the_engine_starts_willing_to_log_its_completions() {
+    let mut runtime = voip_or_skip!();
+
+    let previous = runtime
+        .set_engine_log_level(9)
+        .expect("the threshold is a plain word in memory");
+    assert_eq!(
+        previous, 4,
+        "level-4 lines are on by default, so their absence is evidence"
+    );
+
+    let restored = runtime.set_engine_log_level(previous).expect("set back");
+    assert_eq!(restored, 9, "the write took effect");
+}

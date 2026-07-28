@@ -786,6 +786,28 @@ impl Runtime {
         Ok(())
     }
 
+    /// Sets how much the engine is willing to log, and returns the old level.
+    ///
+    /// Every line goes through one threshold compare: the dispatcher emits only
+    /// when the level stored at `LOG_LEVEL` is at least the line's own. The
+    /// logging wrappers pick the level — 8414 logs at 3, 8416 at 4 — and this
+    /// module starts at **4**, so both are already on.
+    ///
+    /// Read it before concluding anything from a missing line. A subsystem's
+    /// "finished" line is level 4, and if the threshold were lower its absence
+    /// would say nothing about whether the subsystem ran. Here it is not lower,
+    /// which is what makes such an absence evidence. No module patching is
+    /// involved: the threshold is a plain word in memory.
+    pub fn set_engine_log_level(&mut self, level: i32) -> Result<i32> {
+        /// The dispatcher's threshold. Both logging wrappers reduce to
+        /// `if (*(i32*)LOG_LEVEL >= level) emit(...)`.
+        const LOG_LEVEL: u32 = 1_263_116;
+
+        let previous = self.state().read_u32(LOG_LEVEL)? as i32;
+        self.write_bytes_at(LOG_LEVEL, &level.to_le_bytes())?;
+        Ok(previous)
+    }
+
     /// Reads back the lines the engine has written so far.
     ///
     /// The buffer is not opaque: a 24-byte header carries the number of bytes
