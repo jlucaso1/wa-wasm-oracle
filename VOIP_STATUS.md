@@ -52,88 +52,78 @@ i32.eqz ; if
 ### The failure, measured end to end
 
 The lookup is not the problem. **The key handed to it is null**, so nothing is
-ever compared:
+ever compared. And the array that key comes from is not built inside the engine
+at all — it arrives as an argument:
 
 ```
-10534  make_and_cache_offer   (reads the ctx from *(u32*)1352840; has its own 70008 site)
+wa_call_start_call
+  t5 = *(params + 0)          <- the participant array
+  t6 = *(params + 4)          <- the count
   |
-  +- 11198(param0 = ctx, param1 = local2 + 80, ..., param9 = out-param)   [10 params]
-       *(local2 + 80) == NULL                         <- measured
+  +- 10425  wa_call_start_internal   [25 params; l3 = p3 = t5, l4 = p4 = t6, never reassigned]
        |
-       +- 10297(x) = (x == NULL ? log(line 158), NULL : x->[0])   [32 bytes]
+       +- 11198(ctx, l3, l4, ...)   [10 params]
+            if it returns non-zero:
+              "wa_call_start_internal, make_and_cache_offer failed: %d"
             |
-            +- key NULL -> 10530(ctx, NULL) -> 10535 returns before its loop
-                        -> 0 -> offer.cc:485 -> 70008
+            +- 10297(*(l3)) -> NULL          <- measured
+                 10297(x) = (x == NULL ? log(line 158), NULL : x->[0])
+                 |
+                 +- 10530(ctx, NULL) -> 10535 returns before its loop
+                                     -> 0 -> offer.cc:485 -> 70008
 ```
 
-`local2` is `SP - 416`, a stack frame inside 10534, and `local2 + 80` is an
-**array of 64 pointers** — `memory.fill(local2+80, 0, 256)` zeroes it on entry.
-There is no `i32.store offset=80` anywhere in the function; the one write uses a
-computed address, and it is **conditional**:
+**So the null is `params->[0]->[0]`: the first entry of the array the host
+supplies.** The engine does not assemble it, which puts the defect close to the
+host boundary — quite possibly on our side of it, in how `startVoipCall` is
+called.
 
-```
-local4 = call 10532(group, local8, jid = *(local2+408), 2, 1, ctx->group)
-if (local4 == 0) -> skip                     <- this is what happens
-*(local4 + 80) = 1
-*(local2 + 80 + local6*4) = *(local2 + 408)  <- the array write, never reached
-local6++
-```
+Measured pieces: `*(l3)` is null (patch 10297's null-check body to store a
+sentinel and return; it fires), `11198`'s `arg0` is `0x6d0018`, the same context
+`*(u32*)1352840` holds, and `arg1` of 10535 is 0 against a control that stores
+`-1` at the same site.
 
-**So `10532` returns NULL, the participant never enters the array, element 0
-stays at the fill value, and the offer fails four frames later.** 10532 is 2226
-bytes, calls `10274` (`wa_call_user_jid_create_from_device_jid`) twice and the
-JID comparator `10284` twice, and — importantly — **returns without logging**:
-no new engine-log line appears between the transport lines and the 70008. That
-is where the remaining work is.
+**Next experiment:** find the `params` struct and read `*(params+0)` and
+`*(params+4)` at runtime. A count of zero, or an array whose first slot is null,
+says the peer list never reached the engine.
 
-`oracle abi <module> --index <n>` names these, by resolving the constants each
-one hands its logger:
+### The caller this file used to name, and why it is the wrong one
+
+`grep "self.f11198_"` over the decompiled module returns **two** call sites: one
+in `10534`, one in `10425`. An earlier draft of this section traced the first,
+and everything it concluded — that `10534` builds a 64-pointer array at
+`local2+80`, that a conditional write leaves element 0 null, that `10532`
+returning null is the cause — describes **a path that does not run**.
+
+Two things settle which one does. In a healthy baseline no
+`call_create_participants_*` or `wa_call_invite_*` message appears at all; break
+the run and `call_create_participants_for_1_to_1_call` shows up, and that string
+lives inside `10425` (which carries both the `1_to_1` and `n_way_group`
+variants and picks by branch). And the `if != 0` guarding `10425`'s call emits
+the exact line the log shows. `10425` is `wa_call_start_internal`.
+
+Two smaller corrections from the same detour, worth keeping because both cost
+real time:
+
+* In the `10534` path the array write is **not** conditional. `if (l4 == 0)
+  break` skips only the `*(l4+80) = 1` that follows; the write to
+  `*(l2+80+l6*4)` happens either way. That was a misread `br_if` depth.
+* `5233` is not a validity mask. `arg3` is 2, measured, and the guard reads
+  `(both non-null) & ((1 << arg3) & 5233) == 0 || arg3 > 12)` — being *outside*
+  the mask is what lets execution continue.
+
+`oracle abi <module> --index <n>` names functions by resolving the constants
+they hand their logger. Trust the `__func__` argument of an assert over a
+derived name: the decompiler's own naming called `10532`
+`wa_vid_quality_manager_get_vid_rate_control`, from a string it references once
+in a message about a *callee* failing, while its asserts say
+`wa_call_group_create_participant` repeatedly.
 
 | index | name | file |
 | --- | --- | --- |
-| 11198 | `make_and_cache_offer` | `xplat/wa-voip/wacall/system/src/messages/senders/offer.cc` |
-| 10534 | `wa_call_invite` | `xplat/wa-voip/wacall/system/src/core/call_membership.cc` |
-
-The same command reports 10532's entry guard, which is the current frontier:
-
-```
-(arg0 != 0 && arg5 != 0)  AND  ( ((1 << arg3) & 5233) == 0 || arg3 > 12 )
-```
-
-`5233` is a validity mask over an enum of 0..12 — bits {0, 4, 5, 6, 10, 12} —
-and it is the same constant `10530` applies to a participant's `+8` field.
-`arg3` is **2**, measured (store `arg3 + 1`, read back 3), so it is indeed
-outside the mask.
-
-**That guard is not the bug.** Forcing the branch the other way — push `1` so
-the `br_if` is taken and the block body is skipped — gives four consistent runs
-of 82-88 lines, no `70008`, and new messages:
-
-```
-call_create_participants_for_..._call: self participant not created
-start_precall failed creating participants
-EVENT: Call is ending
-```
-
-So the block body is the **creation** path, not an error path, and 10532 is what
-creates a participant. The error vanished because the call died sooner — the
-exact trap the run-length check above exists to catch.
-
-### What the healthy baseline says, and the current lead
-
-A run that reaches ~200 lines logs `wa_call_group_create_participant updating
-peer jid to: 6677:0@lid`, and `getCallInfo` reports `participant_count: 2` — self
-(`99887766554433@lid`, `is_self`, state 7) and peer (`11223344556677@lid`,
-state 2). **The participants already exist in the group** by the time
-`wa_call_invite` calls 10532 to populate its own local array, and 10532 returns
-null. 10532 calls the JID comparator `10284` twice, which is the shape of an
-existence check.
-
-**Lead, not a finding: 10532 may be returning null because the participant is
-already there.** If that holds, the defect is ordering or duplication in how
-`startVoipCall` is driven, not anything about JID content. Settling it means
-instrumenting 10532's return points with distinct values, or its two `call
-10284` sites.
+| 11198 | `make_and_cache_offer` | `messages/senders/offer.cc` |
+| 10425 | `wa_call_start_internal` | `core/call_lifecycle.cc` |
+| 10532 | `wa_call_group_create_participant` | `core/call_membership.cc` |
 
 ### What this replaces
 
@@ -213,6 +203,25 @@ Three things worth knowing before trusting a run:
 * Whether the engine's log is real. After an incoming offer followed by an
   outgoing call it sometimes fills with random printable bytes instead of
   messages, which reads as "the call went quiet" when it means the opposite.
+
+## Read the module as source before disassembling anything
+
+`unwasm` (`~/projects/unwasm`) decompiles this module into Rust:
+
+```sh
+unwasm decompile D5pLH9sfOOl.wasm -o generated.rs   # 2.4M lines, 13347 functions, ~1 min
+grep -n "fn f10532" generated.rs                    # then awk to the next `pub(crate) fn f`
+```
+
+It annotates every `i32.const` with the string it addresses, which is what makes
+the output readable — a bare `call 8502` says nothing, but
+`f8502_voip_assert(0, "…/call_membership.cc", "wa_call_group_create_participant",
+1665)` says everything. Both corrections in the section above came from reading
+it; neither was visible in hours of hand-decoding, and one of them (a misread
+`br_if` depth) had sent the whole investigation down a path that does not run.
+
+Reach for it first. Disassembly is for confirming a specific byte you are about
+to patch.
 
 ## The one tool to reach for first
 
