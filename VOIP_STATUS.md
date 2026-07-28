@@ -78,14 +78,31 @@ supplies.** The engine does not assemble it, which puts the defect close to the
 host boundary — quite possibly on our side of it, in how `startVoipCall` is
 called.
 
-Measured pieces: `*(l3)` is null (patch 10297's null-check body to store a
-sentinel and return; it fires), `11198`'s `arg0` is `0x6d0018`, the same context
-`*(u32*)1352840` holds, and `arg1` of 10535 is 0 against a control that stores
-`-1` at the same site.
+**The "null key" step is the weak link, and it is weak for a specific reason.**
+It was measured by patching the *body* of 10297 and of 10535 — and a body patch
+reports whichever call happened to run, not the one on the path being traced:
 
-**Next experiment:** find the `params` struct and read `*(params+0)` and
-`*(params+4)` at runtime. A count of zero, or an array whose first slot is null,
-says the peer list never reached the engine.
+| function | call sites |
+| --- | --- |
+| `10284` | 58 |
+| `10530` | 32 |
+| `10297` | 10 |
+| `10535` | 3 |
+| `11198` | 2 |
+
+Measured against a single-caller body instead — `wa_call_start_call`'s own —
+`*(params+0)` is `0x24bed0`, and dumping it gives `+0 = 0x24bf3a`,
+`+4 = 0x24bf2e`: **the first slot is not null.** The engine's own log agrees the
+list arrived: `num_peers 1` and `ACTION start_precall with 1 peers`.
+
+So the chain above is right about *where* it fails and wrong, or at least
+unproven, about *why*. **Never instrument the body of a shared function here.**
+Patch the specific call site, which the decompiled source makes findable, or a
+function with one caller — and always pair it with a control variant.
+
+**Next experiment:** instrument `11198`'s call site inside `10425` (there are
+only two sites, and this is the one that runs) to capture `l3` and `l4` as that
+call actually receives them.
 
 ### The caller this file used to name, and why it is the wrong one
 

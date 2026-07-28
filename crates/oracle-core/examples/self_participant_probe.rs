@@ -561,6 +561,29 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Follow whatever a patched module parked in the low scratch words.
+    //
+    // The words themselves are not reliably free — an unpatched run already has
+    // values in some of them — so this prints what it followed rather than
+    // asserting the pointer is ours. A plausible heap address that dereferences
+    // to structure is worth seeing; anything else shows up as obvious garbage.
+    for slot in [24u32, 28, 36] {
+        let Ok(word) = runtime.read(slot, 4) else {
+            continue;
+        };
+        let ptr = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+        if !(0x10_000..0x400_0000).contains(&ptr) {
+            continue;
+        }
+        println!("--- following *({slot}) = {ptr:#x} ---");
+        if let Ok(block) = runtime.read(ptr, 64) {
+            for (i, w) in block.chunks_exact(4).enumerate() {
+                let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                println!("  +{:<3} = {v:#x}", i * 4);
+            }
+        }
+    }
+
     println!("--- distinct JID strings in memory ---");
     {
         let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
