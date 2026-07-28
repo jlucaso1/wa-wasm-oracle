@@ -704,11 +704,23 @@ fn main() -> anyhow::Result<()> {
         sample(&mut runtime, base, &format!("re-read {base:#x}"));
     }
 
-    for line in runtime
-        .engine_log_from(mark)
+    // Say how much is being hidden before hiding it.
+    //
+    // The filter below is a display choice, and reading its output as the whole
+    // log makes this run look like it takes a far shorter path than it does —
+    // which reads as "that code never ran" when the code ran and simply said
+    // nothing matching. Print the count first so the two cannot be confused.
+    let lines = runtime.engine_log_from(mark);
+    let shown: Vec<_> = lines
         .iter()
         .filter(|line| line.contains("make_and_cache_offer") || line.contains("Calling"))
-    {
+        .collect();
+    println!(
+        "--- engine log: {} lines, showing the {} about the call ---",
+        lines.len(),
+        shown.len()
+    );
+    for line in shown {
         println!("  | {}", line.trim());
     }
 
