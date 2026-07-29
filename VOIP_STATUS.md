@@ -604,9 +604,17 @@ zero is aligned and in bounds), `0x64fa78` with it set, and with the flag zeroed
 the code should not reach the atomic at all. It traps in every one.
 
 Which says the field holds something else by the time the worker runs than it
-held at initialisation — something not four-byte aligned, written in between. If
-that writer is the stack itself landing on the pthread struct, it would account
-for the whole thing, including why it only appears once the stack is moved.
+held at initialisation. **Patching that instruction from `i32.atomic.load` to a
+plain `i32.load` — same four bytes — says what**: the trap becomes *out of bounds
+memory access*, five times, at the same address. So the pointer is not merely
+unaligned, it is outside linear memory. Garbage.
+
+And the arithmetic points at where the garbage comes from. Worker 1's pthread
+sits at `0x820030`; the stack its own struct names runs `0x822350..0x832350`. The
+struct is **8992 bytes below the stack's low end**, so a thread that overruns its
+64 KiB writes over its own pthread — `+112` included. That accounts for the whole
+shape: the field is fine at init, garbage by the time the sampler reads it, and
+only when the stack has been moved somewhere with the struct beneath it.
 
 So moving the stack does not corrupt anything and does not run out of anything:
 it puts some atomic on an address that is not aligned for it. The stack tops
