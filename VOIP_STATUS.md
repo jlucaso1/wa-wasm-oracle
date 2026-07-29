@@ -752,7 +752,10 @@ changes, nothing is written to memory, and no offset moves.
 
     wa_call_start_internal, make_and_cache_offer failed: 70003
 
-70003 is the third site, `offer.cc:485`:
+70003 is the third site, and it really is `offer.cc:485` — the sixteen bytes
+before its `i32.const 70008` are `i32.const 0`, `i32.const 765257`,
+`i32.const 307169`, `i32.const 485`, `call 8502`, so the positional mapping from
+byte order to source line holds:
 
     l11 = load32(l1, 0)                              // a participant entry
     l15 = wa_call_participant_jid_get_user_jid(l11)  // its *user* jid
@@ -830,8 +833,18 @@ neither is obvious.
   capture that word already holds `0xFAE5C6B7` by the end of a call.
 - **The assert's own callback slot at 1351212 reads as zero, which looks free**,
   but `f10347_update_voip_params_in_use2` also addresses it.
-- `unwasm constants <module> <address>` answers "does anything address this
-  word" directly, and 1351220 is addressed by nothing in the module.
+- `unwasm constants <module> <address>` does **not** answer "does anything touch
+  this word". It finds `i32.const <address>`, and almost every struct field is
+  reached as `base + offset`, which never appears as a constant. 1351220 has no
+  `i32.const` anywhere and is still not free: storing to it takes a run from 167
+  engine log lines to 126 and makes the offer failure stop being logged, and the
+  stored value is gone by the time the host reads it. Both failed store
+  experiments in this file were writing into memory the engine uses.
+
+Finding a genuinely free word in this module is therefore still open. What
+*would* answer it is the watchpoint from `unwasm --instrument-stores`, which
+reports writes by whoever makes them rather than by how they compute the
+address.
 
 So moving the stack does not corrupt anything and does not run out of anything:
 it puts some atomic on an address that is not aligned for it. The stack tops
