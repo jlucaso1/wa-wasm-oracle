@@ -874,9 +874,34 @@ and neither step is the failure:
 
 So the participant jid is built, from a parse that understands `@lid`, out of a
 heap allocation that succeeded — and the field still reaches the offer as zero.
-Where between here and `make_and_cache_offer` it is lost is the open question,
-and the probe technique for answering it is in place: grow the memory, store
-`value + 1` at a site, read it back.
+
+### A hypothesis, labelled as one: the object is a dead stack temporary
+
+The arithmetic fits, which is exactly why it is written here as a hypothesis.
+`start_call_md` takes `frame = g0 - 4176` and `create_participant_jid` takes
+`frame = g0 - 368`, so with the initial stack pointer at `0x24cf60`:
+
+    0x24cf60   stack pointer at entry
+    0x24bf10   start_call_md's frame
+    0x24bda0   create_participant_jid's frame
+    0x24bed0   l3, measured — inside that frame, at +304
+
+If that holds, the pointer `args + 0` carries is a temporary in the frame of a
+function that has already returned by the time `make_and_cache_offer` reads it,
+and the zero is whatever later reused that stack.
+
+**Do not treat this as established.** An earlier section of this file argued from
+arithmetic that fitted just as well — the pthread sitting 8992 bytes below a
+stack's low end — and a control killed it. What would settle this one: probe
+`*(l3 + 0)` *inside* `create_participant_jid`, before it returns, and compare
+with the same field at `offer.cc:485`. Non-zero there and zero here proves it;
+zero in both places refutes it.
+
+Note the probe technique has a limit worth knowing: a `voip_assert` call site is
+only free real estate when the assert actually fires. `offer.cc:485` works
+because the assert *is* the failure path. Replacing an assert that never fires —
+the first one in `wa_call_start_internal`, for instance — probes nothing, and
+reports "did not run" every time.
 
 Worth noting for whoever picks this up: `wa_call_participant_jid_create_with_
 params` is called by `10603` and by `10642_call_manager_start_dual_call_from_
