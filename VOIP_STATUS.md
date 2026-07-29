@@ -380,7 +380,10 @@ thread 4 stack pointer 0x24cf60
 thread 5 stack pointer 0x24cf60
 ```
 
-`0x24cf60` is the module's initial value, which is also the main thread's.
+`0x24cf60` is the module's initial value, which is also the main thread's. Read
+again after the export hazard above came to light — patched capture, and the
+absent case reported as "unavailable" rather than falling back to zero — it is
+the same five values.
 `_emscripten_thread_init` does not relocate it in this build, whatever its
 documentation says — and the comment in `threads.rs` asserting that it does is
 load-bearing, since it is the reason nothing sets one.
