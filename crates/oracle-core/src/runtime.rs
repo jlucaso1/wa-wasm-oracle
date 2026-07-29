@@ -186,6 +186,17 @@ impl Runtime {
     /// startup allocation landing past the end of a minimum-sized memory. This
     /// gives the harness a way to hand it room up front.
     pub fn grow_memory(&mut self, pages: u64) -> Result<u64> {
+        // A module that *imports* its memory — which the VoIP module does, as
+        // `env.memory`, shared — exports nothing to look up here, and asking
+        // only the exports made this fail with "module exports no memory to
+        // grow" on the one module the crate exists for. The host holds that
+        // memory itself, so grow it there.
+        if let Some(shared) = self.store.data().memory.clone() {
+            let before = shared.grow(pages).context("growing shared guest memory")?;
+            self.sync_memory();
+            return Ok(before + pages);
+        }
+
         // Same lesson as `sync_memory`: the export is not always called
         // `memory`. Looking only for that name silently does nothing on a
         // minified module.
@@ -194,9 +205,9 @@ impl Runtime {
             .data()
             .memory_export
             .clone()
-            .ok_or_else(|| anyhow!("module exports no memory to grow"))?;
+            .ok_or_else(|| anyhow!("module neither imports nor exports a memory to grow"))?;
         let Some(Extern::Memory(memory)) = self.instance.get_export(&mut self.store, &name) else {
-            return Err(anyhow!("module exports no memory to grow"));
+            return Err(anyhow!("module exports no memory named `{name}` to grow"));
         };
         let before = memory
             .grow(&mut self.store, pages)

@@ -777,17 +777,27 @@ So `get_participant` finds nothing. It walks the group's participants comparing
 with `f10284`, which is a **textual** comparison — `pj_strcmp` on the `pj_str` at
 offset +8 of each jid.
 
-**The walk reaches the comparison, and the comparison is what fails.** Those are
-two different failures — a participant count of zero skips the loop entirely and
-returns null without comparing anything — and patching `f10284` to return 1
-unconditionally (its first five bytes, `local.get 0; local.get 1; i32.eq`, become
-`i32.const 1; return; nop; nop`) tells them apart: `make_and_cache_offer failed:
-70003` disappears. If the loop never ran, forcing the comparator could not have
-changed the outcome.
+**None of it is reached: the participant pointer is null.**
 
-That patch is a blunt instrument — `f10284` has 58 call sites, so the run then
-breaks elsewhere, at *"Call ending without valid self_participant or
-peer_participant"*. The inference it supports is only the narrow one above.
+`offer.cc:485` reads `l11 = *(l1 + 0)` — `l1` is `make_and_cache_offer`'s second
+argument — and hands it to `get_user_jid`. Storing `l11 + 1` into scratch at that
+site (the assert's sixteen bytes become `i32.const SCRATCH; local.get 11;
+i32.const 1; i32.add; i32.store`, encoding the value so that 0 means "did not
+run") reads back **1**. The store ran and `l11` is zero.
+
+So the chain is: `get_user_jid(0)` asserts at `wa_call_participant_jid.cc:158`
+and returns 0; `get_participant(call, 0)` hits its own null check, asserts at
+`call_membership.cc:1382`, and returns 0; `f10530` returns 0; 485 fires. Nothing
+is ever compared and no jid form is involved.
+
+This also retracts an inference recorded here earlier. Patching `f10284` to
+return 1 unconditionally makes 70003 disappear, and that was read as proof that
+the search loop reaches the comparison. `f10284` has 58 call sites — it is a
+blunt instrument, the run breaks elsewhere afterwards, and what it changed was
+something upstream of this site, not the comparison at it.
+
+The open question is now much narrower and much better posed: **what is `l1`, and
+why is its first word null?**
 
 What remains is which two strings differ. The engine's log says
 `wa_call_group_create_participant updating peer jid to: 6677:0@lid` — the
