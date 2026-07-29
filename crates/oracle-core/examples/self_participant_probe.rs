@@ -165,6 +165,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut runtime = Runtime::instantiate(&bytes)?;
     runtime.set_thread_policy(ThreadPolicy::Spawn);
+    // Same regime as `outgoing_call`: registered as the main runtime thread with
+    // `can_block = 0`, so measurements taken here describe the run that example
+    // produces rather than a differently-configured one.
+    runtime.set_main_thread_registration(true);
     runtime.run_ctors()?;
     runtime.attach_log_ring(4 << 20)?;
 
