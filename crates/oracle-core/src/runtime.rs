@@ -50,6 +50,12 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         let shared = Arc::clone(&self.store.data().shared);
         shared.request_shutdown();
+        // Bump the epoch as well as setting the flag. The flag alone is only
+        // seen at a host call; this interrupts a worker wherever it is, which
+        // is what stops its `Store` — and the module's memory — from outliving
+        // this runtime. Each spawned thread sets a deadline of one epoch, and
+        // nothing else ever increments, so no interruption happens until here.
+        self.store.engine().increment_epoch();
         // Bounded: a thread that will not stop must not hold up the process.
         shared.wait_until_idle(std::time::Duration::from_secs(2));
     }
@@ -116,6 +122,10 @@ impl Runtime {
         let module = Module::new(&engine, bytes).context("loading module")?;
 
         let mut store = Store::new(&engine, HostState::default());
+        // Required, not optional: with epoch interruption enabled a store whose
+        // deadline was never set traps on its first instruction. One tick is
+        // the whole budget, and only `Runtime::drop` ever spends it.
+        store.set_epoch_deadline(1);
         store.set_fuel(DEFAULT_FUEL).ok();
 
         let mut linker = Linker::new(&engine);

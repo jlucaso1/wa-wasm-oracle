@@ -323,11 +323,17 @@ f100(8266, l10, "event_type");        // l10["event_type"]  <- throws here
 ```
 
 — so the value is already a number before any field is read, and the conversion
-dies before touching `previous_state` or the rest. That is engine-internal, built
-from the engine's own state; nothing crossing the boundary from this side
-obviously decides it. The empty `getVoipParam("options.*")` and *"Application
-settings not loaded"* remain the plausible upstream, both being configuration a
-real client is handed by the server.
+dies before touching `previous_state` or the rest. **This is fixed, and it was a symptom rather than a bug of its own.** With the
+thread-status profiler neutralised the conversion no longer throws: a run
+delivers four events cleanly — `Call state changed`, `Call offer send failed`,
+`Field stats ready`, `Call is ending` — and `VoipEvent.cpp:88` does not appear.
+The dying workers were the cause; the JSON was fine.
+
+Two things above did not survive either. The function that builds the JSON is
+not 11937 — `unwasm` names 11937 `rk_optimizer_check_best_transport`, which is
+transport selection, so that index came from somewhere else. And the empty
+`getVoipParam("options.*")` and *"Application settings not loaded"* were never
+the upstream: both are still there in a run that emits every event.
 
 **Determinism is load-dependent, and the earlier claim needs that caveat.**
 Registering the main thread gave 167 engine-log lines on every run of an idle

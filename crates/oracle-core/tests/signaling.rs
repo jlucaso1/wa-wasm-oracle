@@ -1171,16 +1171,20 @@ fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
     runtime.refuel();
     let Some(json) = info.as_ref().ok().and_then(|value| value.as_str()) else {
         // A trap here is the corruption `VOIP_STATUS.md` describes, not a new
-        // fault: every guest thread runs on the main thread's stack, so state
-        // this call wrote can be gone by the time `getCallInfo` reads it, and
-        // what traps is `pj_ansi_strxcpy` on a pointer that no longer means
-        // anything. Registering the main thread makes the call reach further,
-        // which is what exposes it.
+        // fault. The shared stack is *not* the reason, though it was written
+        // down as one here: every guest thread does start from the main
+        // thread's stack pointer, but giving each worker its own 4 MiB stack —
+        // confirmed from inside the guest with `stackSave` — changes nothing.
+        // What actually stops the engine is static data being corrupted at
+        // runtime, which shows up as a set profiler flag at 0x14B958 and an
+        // out-of-linear-memory pointer in `pthread + 112`. The mechanism is
+        // still open.
         //
-        // Reported and skipped rather than asserted: the engine cannot answer
-        // this question while threads share a stack, and a red suite here would
-        // say "the self participant is missing" about a run that never got to
-        // have one.
+        // Reported and skipped rather than asserted, because a red suite here
+        // would say "the self participant is missing" about a run that never
+        // got far enough to have one. That makes this test vacuous whenever it
+        // takes this path — it is a placeholder for the assertion below, not
+        // evidence for it.
         eprintln!(
             "getCallInfo could not answer — see VOIP_STATUS.md, threads share one stack: {info:?}"
         );

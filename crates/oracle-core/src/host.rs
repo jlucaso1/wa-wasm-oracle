@@ -116,6 +116,15 @@ pub(crate) fn build_engine() -> Result<Engine> {
     config.wasm_multi_memory(true);
     config.wasm_tail_call(true);
     config.consume_fuel(true);
+    // Epoch interruption is what makes shutdown reliable. A guest worker only
+    // notices `request_shutdown` at a host call, and its fuel is topped up
+    // rather than spent down, so a thread that computes for a long time between
+    // host calls outlives the `Runtime` that spawned it — along with its
+    // `Store` and the module's memory. Twenty-three sequential tests
+    // accumulated eighteen gigabytes that way and the suite was killed by the
+    // OOM killer. Bumping the epoch interrupts guest code from outside, with no
+    // cooperation from the guest.
+    config.epoch_interruption(true);
 
     // Compiled modules are cached on disk, keyed by their bytes and the
     // compiler settings. The captured modules never change, so after the first

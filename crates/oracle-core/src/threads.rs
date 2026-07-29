@@ -108,10 +108,16 @@ impl Spawner {
                     arg,
                 );
                 if let Err(error) = outcome {
-                    // A worker that ends on a trap is expected here — it is
-                    // usually the fuel bound on a loop waiting for work that
-                    // never arrives — so this is recorded, not propagated.
-                    shared.log(id, format!("thread {id} ended: {}", first_line(&error)));
+                    // A worker that ends on a trap is expected here — either
+                    // the shutdown interrupt from `Runtime::drop` or a loop
+                    // waiting for work that never arrives — so this is
+                    // recorded, not propagated.
+                    let why = if shared.is_shutting_down() {
+                        "host shutting down".to_owned()
+                    } else {
+                        first_line(&error)
+                    };
+                    shared.log(id, format!("thread {id} ended: {why}"));
                 }
                 shared.thread_finished();
             });
@@ -152,6 +158,10 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
 
     let mut store = Store::new(&ctx.engine, state);
     store.set_fuel(THREAD_FUEL).ok();
+    // Trap as soon as the epoch moves. Only `Runtime::drop` ever moves it, so
+    // this costs nothing during a run and makes shutdown independent of the
+    // worker reaching a host call.
+    store.set_epoch_deadline(1);
 
     let mut linker = build_linker(&mut store, &ctx.module)?;
     linker
@@ -293,10 +303,18 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     // Why a worker stopped is the difference between "it finished its work"
     // and "the host cut it short", and the two need telling apart: the VoIP
     // engine's pool is empty by the time a call is placed.
+    // A thread cut short by shutdown is not a fault, and saying so matters:
+    // `Runtime::drop` interrupts every worker by bumping the epoch, so without
+    // this every clean teardown reports a handful of traps and a run that went
+    // perfectly reads as one that broke.
+    let stopped_by_shutdown = ctx.shared.is_shutting_down();
     ctx.shared.log(
         ctx.id,
         match &outcome {
             Ok(()) => format!("thread {} routine returned", ctx.id),
+            Err(_) if stopped_by_shutdown => {
+                format!("thread {} stopped: host shutting down", ctx.id)
+            }
             Err(error) => format!(
                 "thread {} stopped: {}",
                 ctx.id,
