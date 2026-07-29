@@ -835,6 +835,9 @@ two agree.
 
 The probe only reports on runs that reach the site; the ones that stop earlier
 read 0 and say "did not run", which is exactly what the `+ 1` encoding is for.
+Repeated five times, three runs reached the site and all three read zero — so
+the null is the steady state there, not a one-off, and everything above rests on
+a measurement that repeats.
 
 And the object in `args + 0` is built one call earlier, by the bridge itself:
 
