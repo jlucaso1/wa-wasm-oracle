@@ -583,8 +583,30 @@ Zeroing the profiler's enable byte at 1358168 before the worker runs does not fi
 it either, and that one is contradictory: with the flag clear, function 12302
 returns at its first guard and cannot reach an atomic, yet it is still where all
 five workers trap. Either the write does not take or something sets the flag
-again between there and the entry point. Worth resolving before trusting any
-reading of that path.
+again between there and the entry point.
+
+**The instruction is isolated, and it sharpens the contradiction rather than
+settling it.** Wasmtime's attribution is right — 12302's body is
+`0x7f3ccb..0x7f3d45` and the backtrace's `0x7f3cea` falls inside it — and the
+body decodes to:
+
+```
+i32.const 1358168 ; i32.load8_u ; i32.eqz ; br_if 0    <- leaves if the flag is clear
+global.get 3 ; local.tee 2 ; i32.eqz ; br_if 0         <- leaves if the pthread is null
+local.get 2
+i32.atomic.load align=2 offset=112                     <- *(pthread + 112)
+i32.atomic.load align=2 offset=0                       <- 0x7f3cea, the trap
+```
+
+`align=2` means four-byte alignment. And in all three configurations measured the
+value it loads through should be fine: `0` with the sixth argument clear (address
+zero is aligned and in bounds), `0x64fa78` with it set, and with the flag zeroed
+the code should not reach the atomic at all. It traps in every one.
+
+Which says the field holds something else by the time the worker runs than it
+held at initialisation — something not four-byte aligned, written in between. If
+that writer is the stack itself landing on the pthread struct, it would account
+for the whole thing, including why it only appears once the stack is moved.
 
 So moving the stack does not corrupt anything and does not run out of anything:
 it puts some atomic on an address that is not aligned for it. The stack tops
