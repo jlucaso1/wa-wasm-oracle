@@ -845,10 +845,27 @@ line:
   (`*(list + 0) == *(list + 4)`, begin equal to end). Note the *or*: a non-empty
   peer with an empty list fails here too.
 
-Past both, it copies its fourth argument into its frame and calls table slot 675
-to build the user jid. That call is where to look next: the object comes back
-with its user jid field zero, and both of the guards above are satisfied by what
-we pass — the peer string is not empty and the device list has one entry.
+Past both, the construction goes:
+
+    f96(675, out=frame+188, peer_string, frame+352)   -> f1084, the jid parser
+    l1 = f99(458, frame+188)                          -> f839, moves it to the heap
+    if l1 != 0 { f100(444, frame+340, l1 + 36) }
+    else       { *(frame+348) = 0; *(frame+340) = 0 } <- the zeroing branch
+
+and neither step is the failure:
+
+- **`f1084` (slot 675) is the jid string parser.** It writes a 48-byte struct,
+  zero-fills it when the string is empty, and compares against `"call"`,
+  `"@call"` and **`"@lid"`** — so the LID form we pass is one it knows.
+- **`f839` (slot 458) cannot return null.** It is a move: `malloc(48)`, copy the
+  eight fields across, blank the source. Only an allocation failure returns
+  nothing, so the zeroing branch below it is not the one being taken.
+
+So the participant jid is built, from a parse that understands `@lid`, out of a
+heap allocation that succeeded — and the field still reaches the offer as zero.
+Where between here and `make_and_cache_offer` it is lost is the open question,
+and the probe technique for answering it is in place: grow the memory, store
+`value + 1` at a site, read it back.
 
 Worth noting for whoever picks this up: `wa_call_participant_jid_create_with_
 params` is called by `10603` and by `10642_call_manager_start_dual_call_from_
