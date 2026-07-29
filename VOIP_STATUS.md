@@ -609,13 +609,45 @@ plain `i32.load` — same four bytes — says what**: the trap becomes *out of b
 memory access*, five times, at the same address. So the pointer is not merely
 unaligned, it is outside linear memory. Garbage.
 
-Where the garbage comes from is still open, and one appealing answer is already
-wrong. Worker 1's pthread sits at `0x820030` and the stack its struct names runs
-`0x822350..0x832350`, leaving the struct 8992 bytes below the stack's low end —
-which reads like a 64 KiB overrun writing over its own pthread. It is not:
-installing a **1 MiB stack from the heap**, nowhere near the struct, fails in
-exactly the same way, same traps, three runs. So the field is corrupted by
-something that is not the thread overrunning its own stack.
+Where the garbage comes from is still open, and the shared stack is not it.
+
+Every worker really does start from the module's initial stack pointer, and that
+really is the same address the main thread uses — that part was measured and
+holds. What does not hold is the conclusion drawn from it. Give each worker
+**its own 4 MiB stack** from the heap, four megabytes apart so no two can reach
+each other, and read the pointer back **from inside the guest** with `stackSave`:
+
+    thread 1 RELOC base=0x86a3d0  sp_agora=0xc6a3d0
+    thread 2 RELOC base=0xcc0030  sp_agora=0x10c0030
+    thread 3 RELOC base=0x10c0038 sp_agora=0x14c0030
+    thread 4 RELOC base=0x15d2388 sp_agora=0x19d2380
+    thread 6 RELOC base=0x1f346b0 sp_agora=0x23346b0
+    thread 5 RELOC base=0x23346b8 sp_agora=0x27346b0
+
+The relocation takes — each pointer is its own base plus four megabytes. And the
+run is unchanged: 27 lines, 11 traps, the same two reasons at the same address.
+So threads sharing one stack is a true statement about this host that does not
+explain the failure, and the fourteen "failed stack fixes" below were failing for
+a reason other than the one they were testing.
+
+The appealing arithmetic was wrong too. Worker 1's pthread sits at `0x820030`
+and the stack its struct names runs `0x822350..0x832350`, leaving the struct 8992
+bytes below the stack's low end — which reads like a 64 KiB overrun writing over
+its own pthread. Moving the stack four megabytes away changes nothing, so it is
+not that either.
+
+Two measurement traps cost several retracted conclusions here, both worth
+knowing:
+
+- **`outgoing_call` prints only log lines containing the word "thread"**
+  (`examples/outgoing_call.rs`, the filter on `runtime.logs()`). A probe labelled
+  `RELOC …` or `STEP …` runs and is recorded and never appears. Two experiments
+  were read as "the code did not run" when the code ran fine.
+- **The module exports no globals.** Only the separately patched capture from
+  `scripts/export_globals.py` does. So `get_export("__global_0")` returns `None`
+  against the normal capture, and a diagnostic written against it prints nothing
+  — silence that reads as "nothing to report". `stackSave` answers the same
+  question through an export that actually exists, and `threads.rs` now uses it.
 
 So moving the stack does not corrupt anything and does not run out of anything:
 it puts some atomic on an address that is not aligned for it. The stack tops

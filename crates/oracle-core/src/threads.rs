@@ -240,15 +240,21 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     // frame comes back wrong, which is exactly the shape of the bug being
     // chased in VOIP_STATUS.md. Report it rather than assume `thread_init` did
     // the right thing.
-    // This module exports its globals positionally — `__global_0` upward — and
-    // global 0 is the stack pointer.
-    if let Some(Extern::Global(sp)) = instance.get_export(&mut store, "__global_0")
-        && let Val::I32(value) = sp.get(&mut store)
-    {
-        ctx.shared.log(
-            ctx.id,
-            format!("thread {} stack pointer {value:#x}", ctx.id),
-        );
+    // Read through `stackSave`, not through an exported global. Global 0 *is*
+    // the stack pointer, but this module exports no globals — only a separately
+    // patched capture does — so asking for `__global_0` here logs nothing at
+    // all, which reads as "the stack is fine" rather than as "not measured".
+    if let Some(save) = instance.get_func(&mut store, "stackSave") {
+        let mut sp = [Val::I32(0)];
+        let reading = match save.call(&mut store, &[], &mut sp) {
+            Ok(()) => match sp.first() {
+                Some(Val::I32(value)) => format!("{value:#x}"),
+                _ => "not an i32".to_owned(),
+            },
+            Err(error) => first_line(&error),
+        };
+        ctx.shared
+            .log(ctx.id, format!("thread {} stack pointer {reading}", ctx.id));
     }
 
     // TLS as well as the pthread, not instead of it. It was an `else if`, so a
