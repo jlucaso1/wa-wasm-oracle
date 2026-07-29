@@ -741,6 +741,42 @@ byte at 1351084 *and* a callback slot at 1351212 that nothing ever fills — so
 naming the site means making `f8502_voip_assert` observable, or re-running the
 unique-site instrumentation on `offer.cc:485` now that the workers survive.
 
+### The site is `offer.cc:485`
+
+Naming it did not need the assert at all. Each site sets the same `70008`, and
+`i32.const 70008` is four bytes (`41 f8 a2 04`) — so is `i32.const 70001`
+(`41 f1 a2 04`), because the sleb128 encoding of anything in this range differs
+only in its low seven bits. Give each site its own code and the engine prints
+the answer itself. `scripts/tag_offer_error_sites.py` does that; no control flow
+changes, nothing is written to memory, and no offset moves.
+
+    wa_call_start_internal, make_and_cache_offer failed: 70003
+
+70003 is the third site, `offer.cc:485`:
+
+    l11 = load32(l1, 0)                              // a participant entry
+    l15 = wa_call_participant_jid_get_user_jid(l11)  // its *user* jid
+    l21 = f10530(call, l15)
+    if l21 == 0 { voip_assert(offer.cc, 485); return 70008 }
+
+`f10530` is a lookup plus a filter: `get_participant(call, jid)`, then reject the
+result if its state (`*(participant + 8)`) is one of the bits in the mask 5233 —
+0, 4, 5, 6, 10, 12.
+
+**It is the lookup, not the filter.** `i32.const 5233` (`41 f1 28`) and
+`i32.const -8192` (`41 80 40`) are both three bytes, and -8192 has every bit
+below 13 clear, so substituting it makes the filter accept every state the
+`state <= 12` guard admits. The run still fails with 70003. (Consistent with
+`getCallInfo`, which reports state 2 for the peer and 7 for us — neither in the
+mask.)
+
+So `get_participant` finds nothing. It walks the group's participants comparing
+with `f10284`, which is a **textual** comparison — `pj_strcmp` on the `pj_str` at
+offset +8 of each jid. The offer looks up by *user* jid; the engine's own log
+says `wa_call_group_create_participant updating peer jid to: 6677:0@lid`, the
+*device* form. That is the shape of the mismatch, and confirming it means
+reading the two strings that reach `f10284`.
+
 Making `f8502_voip_assert` observable was tried and does not work yet. The idea
 fits: the gate at the top of the function is eleven bytes
 (`i32.const 1351084; i32.load8_u; i32.eqz; br_if 0`), which is exactly enough for
