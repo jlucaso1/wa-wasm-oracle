@@ -46,6 +46,17 @@ const RNG_SEED: u64 = 0x5741_5F4F_5241_434C;
 /// How many individual calls are kept with their arguments.
 const MAX_TRACE: usize = 8192;
 
+/// How many log lines are kept, and how long each one may be.
+///
+/// Both bounds exist because an unbounded log is a memory leak waiting for a
+/// hot failing path, and this host found one: a mailbox drain that fails is
+/// polled thousands of times, and each failure was recorded with its full wasm
+/// backtrace. One test reached 43192 lines totalling 8.5 GB, the longest line
+/// 1.1 MB, and the suite was killed by the OOM killer. A truncated line still
+/// says which call failed and where, which is what the log is for.
+const MAX_LOG_LINES: usize = 8192;
+const MAX_LOG_LINE: usize = 2048;
+
 /// One line of host-visible output, tagged with where it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
@@ -63,6 +74,7 @@ struct Trace {
     calls: Vec<HostCall>,
     counts: BTreeMap<String, u64>,
     logs: Vec<LogLine>,
+    dropped_logs: u64,
 }
 
 /// The cross-thread half of the host state.
@@ -183,10 +195,34 @@ impl SharedHost {
         RNG_SEED ^ thread.wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 
-    pub fn log(&self, thread: u64, text: String) {
+    pub fn log(&self, thread: u64, mut text: String) {
+        if text.len() > MAX_LOG_LINE {
+            // On a char boundary, so this cannot split a multi-byte sequence.
+            let cut = (0..=MAX_LOG_LINE)
+                .rev()
+                .find(|at| text.is_char_boundary(*at))
+                .unwrap_or(0);
+            text.truncate(cut);
+            text.push_str(" […truncated]");
+        }
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let mut trace = self.trace.lock().unwrap_or_else(|e| e.into_inner());
+        if trace.logs.len() >= MAX_LOG_LINES {
+            // Counted rather than dropped silently: a reader who sees a log
+            // stop dead needs to know whether that is the end of the run or the
+            // end of the buffer.
+            trace.dropped_logs += 1;
+            return;
+        }
         trace.logs.push(LogLine { seq, thread, text });
+    }
+
+    /// How many log lines were discarded because the buffer was full.
+    pub fn dropped_logs(&self) -> u64 {
+        self.trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dropped_logs
     }
 
     pub fn record(&self, module: &str, name: &str, args: Vec<i64>) {
