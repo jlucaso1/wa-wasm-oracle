@@ -798,14 +798,28 @@ something upstream of this site, not the comparison at it.
 
 ### What `l1` is
 
-Straight through, by static reading rather than by guessing:
+Straight through, by static reading rather than by guessing, and the top of the
+chain is the embind entry point itself:
 
-    call_manager_start_dual_call(args)
+    f1085_start_call_md(p0..p6)          <- startVoipCall's seven arguments
+      builds an args struct, calls table slot 682
+    call_manager_start_dual_call(args)   <- slot 682; no direct callers
       t5 = *(args + 0)
       wa_call_start_internal(…, p3 = t5, …)
         l3 = p3, never reassigned
         make_and_cache_offer(call, l3, …)
           l11 = *(l3 + 0)      <- measured null
+
+`start_call_md` converts the peer (`p0`) and the `alt_jid` (`p4`) with the same
+routine and tag — `f100(271, …)` — and the participant list (`p1`) with
+`f100(680, …)`, so the two jid-shaped arguments go through one path and the list
+through another.
+
+Worth noting for whoever picks this up: `wa_call_participant_jid_create_with_
+params` is called by `10603` and by `10642_call_manager_start_dual_call_from_
+context` — and **not** by `10428`, the entry point this path uses. So on this
+path nothing constructs the participant jid through the usual constructor; it
+arrives already built in the args struct.
 
 And `*(participant_jid + 0)` is exactly what
 `f10297_wa_call_participant_jid_get_user_jid` returns. So the participant-jid
