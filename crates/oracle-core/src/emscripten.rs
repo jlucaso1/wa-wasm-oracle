@@ -218,6 +218,13 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
     // Emscripten blocks here until something posts. Blocking is what this host
     // must not do — see `HostState::register_main_thread` — so a pending
     // notification is consumed instead, which is the same thing minus the wait.
+    //
+    // The reference drains unconditionally: its `checkMailbox` re-registers the
+    // wait and calls `_emscripten_check_mailbox()` every time, letting the
+    // notification decide only when to wake. Doing that here was measured and is
+    // worse — one run in three dies at 26 engine-log lines against 167 — because
+    // that pattern leans on an event loop and on `canBlock=0` to guarantee the
+    // dispatch cannot block, and neither holds on this side.
     linker.func_wrap(
         "env",
         "_emscripten_thread_mailbox_await",
