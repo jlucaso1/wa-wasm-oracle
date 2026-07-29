@@ -295,6 +295,36 @@ non-deterministically at a fixed point, the 24-versus-200-line spread between
 runs of the same module, the traps inside `startVoipCall`, and workers dying on
 wild addresses.
 
+### What the run has been saying all along
+
+Two things sit in `outgoing_call`'s own output and went unread for a long time.
+
+**Call events fail to serialise.** Four times a run, on a thread that is not the
+main one:
+
+```
+VoipEvent.cpp:88 Error converting call event data to JSON:
+  [json.exception.type_error.305] cannot use operator[] with a string argument
+  with number, for event: 16
+```
+
+The engine builds event 16, the conversion throws, and the event never reaches
+the boundary at all — `on_call_event_js_sync` being a stub is downstream of a
+problem that happens before it. Worth finding which field of that event is a
+number where the code indexes it as an object; the empty
+`getVoipParam("options.*")` and *"Application settings not loaded"* are the
+obvious neighbours, since both are configuration a real client is handed by the
+server.
+
+**And the stubs are not the problem.** `Runtime::stubs_called()` reports what the
+guest actually called, and over a full run that is one thing:
+`env::emscripten_check_blocking_allowed`, once. Invented answers barely touch
+this run.
+
+Both were printed by the example every time. Read the whole output before
+forming a hypothesis — several of the hypotheses above would never have been
+written.
+
 ### The 347 KB fill is not it — measured
 
 `wa_call_group_create_participant` does zero 347 KB, and again 287 KB past that:
