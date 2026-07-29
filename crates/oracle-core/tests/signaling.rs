@@ -145,7 +145,7 @@ fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
     // Wait for the media stack to finish announcing itself rather than for the
     // threads to finish: PJSIP's worker is a loop bounded only by its fuel, so
     // a full quiesce would always time out.
-    wait_for_reaction(&runtime, 0);
+    wait_for_reaction(&mut runtime, 0);
     Ok(runtime)
 }
 
@@ -295,13 +295,21 @@ fn deliver(runtime: &mut Runtime, stanza: String) -> Vec<String> {
 /// says nothing about whether it finished. A fixed sleep is wrong in both
 /// directions — too short under load, wasted otherwise — so this waits for the
 /// log to grow and then go quiet. Returns early on the common path.
-fn wait_for_reaction(runtime: &Runtime, mark: usize) {
+fn wait_for_reaction(runtime: &mut Runtime, mark: usize) {
     let deadline = std::time::Instant::now() + REACT_TIMEOUT;
     let mut last_len = runtime.engine_log().len();
     let mut unchanged_since = std::time::Instant::now();
 
     while std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
+        // Drain what the engine parked for this thread.
+        //
+        // A quiet log is not a finished reaction: with the main thread
+        // registered, work the engine hands to it waits in the proxy queue, and
+        // only the host takes it out. Waiting for quiet without draining reports
+        // "the engine did nothing" about a run in which it queued the answer and
+        // nobody collected it.
+        runtime.process_queued_calls();
         let len = runtime.engine_log().len();
 
         if len != last_len {
