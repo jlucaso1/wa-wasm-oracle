@@ -276,7 +276,15 @@ It also accounts for the run-to-run spread recorded above (24 versus ~200 log
 lines from the same unpatched module), and for why the group's participants are
 correct while the raw array is not: those were copied.
 
-### The leading hypothesis: guest threads share one stack
+### A hypothesis that led for a long time and is wrong: the shared stack
+
+**Refuted.** Read this section as a record of where the investigation went, not
+as an open lead. Everything it observes is true; the conclusion is not. Giving
+each worker its own 4 MiB stack, confirmed from inside the guest with
+`stackSave`, changes nothing — 27 log lines and eleven traps either way. What
+actually killed the workers was `f12302`, the thread-status profiler, and what
+it was reading was corrupted static data. See "The thread-status profiler was the
+blocker".
 
 Not how the list is passed — that was checked. `Runtime::build_vector` builds the
 `StringList` with the engine's own constructor and `push_back`, exactly as the JS
@@ -376,7 +384,7 @@ from a worker thread, and the two do not agree. The file offset it quotes,
 4667241, holds `53 22 00 04 40 20 01 10` rather than a fill. Both wanted checking
 before anything was built on them, and this is that check.
 
-### Confirmed: every guest thread starts on the same stack
+### Confirmed, and it does not matter: every guest thread starts on the same stack
 
 ```
 thread 1 stack pointer 0x24cf60
@@ -408,7 +416,7 @@ measured on the patched copy, and the stack pointer is global 0.
 knowing, because reading `__global_3` on the original returns nothing and looks
 like a null pthread.
 
-### The obvious fix does not work
+### The obvious fix does not work — and neither does the working one
 
 Allocating 512 KiB per thread with the guest's own `malloc` and writing global 0
 does give each thread a distinct region, far from the main thread's:
@@ -1224,6 +1232,16 @@ Each was implemented or configured, measured, and reverted.
 | Legacy-form JID as the fifth `startVoipCall` argument | Identical failure |
 | Registering a video renderer | No such embind API exists; the video imports are never called |
 | AB props for logging | No change in verbosity |
+| Guest threads sharing the main stack | 4 MiB per worker, `stackSave`-confirmed: identical run |
+| Memory accumulating across tests | No accumulation; one test reached 12 GB alone, through an unbounded log |
+| A missing self participant (`offer.cc:463`) | `getCallInfo` reports `is_self: true` and `participant_count: 2` |
+| A user-versus-device jid mismatch at the lookup | Lookup patched to use the device form: identical 70003 |
+| `f10530`'s state filter rejecting the participant | Mask 5233 replaced by -8192, which accepts every state: identical 70003 |
+| One device vs two devices vs a bare LID in the list | All three identical |
+| Legacy form as the *first* `startVoipCall` argument | Rejected outright: "peer_participant_jids must be LID" |
+| The 12 boolean AB props WhatsApp Web pushes | Accepted, "settings not loaded" stops, 167 -> 193 lines, same 70003 |
+| The jid string parser (`f1084`) not knowing `@lid` | It compares against `"call"`, `"@call"` and `"@lid"` |
+| `f839` returning null for the user jid | It is a move — `malloc(48)`, copy, blank — and cannot |
 
 ## The architectural gap
 
