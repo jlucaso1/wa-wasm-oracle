@@ -815,6 +815,19 @@ routine and tag — `f100(271, …)` — and the participant list (`p1`) with
 `f100(680, …)`, so the two jid-shaped arguments go through one path and the list
 through another.
 
+**And `l3` is a stack address.** Probing it the same way — store `l3 + 1`, so
+that 0 still means "did not run" — reads back `0x24bed0`. The initial stack
+pointer is `0x24cf60` and `start_call_md`'s frame is 4176 bytes, so `l3` points
+inside that frame: the participant jid is a **local struct the bridge builds on
+its own stack**, and its first field — the user jid — is never filled.
+
+That is also the address this file has been calling "the participant array
+`make_and_cache_offer` reads", from much earlier and by a different route. The
+two agree.
+
+The probe only reports on runs that reach the site; the ones that stop earlier
+read 0 and say "did not run", which is exactly what the `+ 1` encoding is for.
+
 Worth noting for whoever picks this up: `wa_call_participant_jid_create_with_
 params` is called by `10603` and by `10642_call_manager_start_dual_call_from_
 context` — and **not** by `10428`, the entry point this path uses. So on this

@@ -33,6 +33,11 @@ use oracle_core::{Catalog, Runtime, ThreadPolicy, Value};
 /// passed as `"{}"` — a settings blob it never was — which is what
 /// `get_app_jids: wa_call_device_jid_from_string failed` and `Failed to fetch
 /// typed self lid device jid` were reporting.
+/// Onde as sondas de bytecode gravam. Fica acima do que a engine usa porque o
+/// host cresce a memoria ate la — o que so funciona desde que `grow_memory`
+/// aprendeu a crescer a memoria *importada*. Verificado por leitura de volta.
+const SCRATCH: u32 = 0x2FF_0000;
+
 const SELF: &str = "15550002222@c.us";
 const SELF_DEVICE: &str = "15550002222:0@c.us";
 /// A LID is a separate identity namespace; the device form carries `:<device>`.
@@ -90,6 +95,11 @@ fn engine_once(bytes: &[u8]) -> anyhow::Result<Runtime> {
     // `getCallInfo` path, so that was reverted. Whatever registration changes
     // for the better here, it changes something else for the worse there.
     runtime.set_main_thread_registration(true);
+    while runtime.memory_size() < (SCRATCH as usize + 0x1_0000) {
+        if runtime.grow_memory(256).is_err() {
+            break;
+        }
+    }
     runtime.run_ctors()?;
     runtime.attach_log_ring(4 << 20)?;
 
@@ -421,6 +431,14 @@ fn main() -> anyhow::Result<()> {
             runtime.refuel();
             runtime.settle(std::time::Duration::from_secs(5));
 
+            // As sondas gravam `valor + 1`, entao 0 significa "nao rodou" e 1
+            // significa "rodou e o valor era zero" — duas coisas que uma sonda
+            // ingenua confunde.
+            match runtime.read_u32_at(SCRATCH) {
+                Ok(0) => println!("   sonda: nao rodou (captura sem patch?)"),
+                Ok(raw) => println!("   sonda: {:#x}", raw - 1),
+                Err(error) => println!("   sonda ilegivel: {error:#}"),
+            }
             println!("   live threads after: {}", runtime.live_threads());
             for note in runtime.logs().iter().filter(|line| line.contains("thread")) {
                 println!("   >>> {note}");
