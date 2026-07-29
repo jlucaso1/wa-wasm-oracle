@@ -44,7 +44,30 @@ const PEER_LID_DEVICE: &str = "11223344556677:0@lid";
 /// Sixteen hex characters, the shape WhatsApp Web generates.
 const CALL_ID: &str = "0011223344556677";
 
+/// Brings the engine up, retrying a startup that fails.
+///
+/// `initVoipStack` fails intermittently — the same flakiness `engine_with_identity`
+/// in `tests/signaling.rs` has always retried around. Without this, one bad
+/// startup aborts the whole example and every shape after it goes unmeasured,
+/// which reads as "the shape was not tried" rather than "the engine did not
+/// start".
 fn engine(bytes: &[u8]) -> anyhow::Result<Runtime> {
+    const ATTEMPTS: usize = 6;
+
+    let mut last = None;
+    for attempt in 1..=ATTEMPTS {
+        match engine_once(bytes) {
+            Ok(runtime) => return Ok(runtime),
+            Err(error) => {
+                println!("   engine startup attempt {attempt}/{ATTEMPTS} failed: {error:#}");
+                last = Some(error);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("engine startup failed")))
+}
+
+fn engine_once(bytes: &[u8]) -> anyhow::Result<Runtime> {
     let mut runtime = Runtime::instantiate(bytes)?;
     runtime.set_thread_policy(ThreadPolicy::Spawn);
     // Register as emscripten's main runtime thread, the way the browser does.
@@ -173,23 +196,31 @@ fn main() -> anyhow::Result<()> {
     // LID in the participant list. Both LID — the engine enforces it:
     // `start_precall peer_participant_jids must be LID, enforce LID for all
     // calls`.
-    // Two shapes, because `make_and_cache_offer` fails at `offer.cc:463` when
-    // `wa_call_group_get_self_participant` returns null: the engine cannot find
-    // *us* in the call's participant group. The list held only the peer, so the
-    // second shape adds our own device LID to see whether that is what makes a
-    // self participant exist.
+    // `make_and_cache_offer` fails at `offer.cc:485`, not at 463 as this
+    // comment used to say: `get_participant` walks the call's group and no jid
+    // comparison matches. The self participant is present — `getCallInfo`
+    // reports it — so adding our own LID to the list is not the missing piece.
+    // See VOIP_STATUS.md.
     // The fifth argument is a *legacy-form* JID in WhatsApp Web, not a LID:
     // `StartCall.js` passes `(g ?? h).toString({legacy: true})`. We have been
     // passing the LID there, which is worth testing directly — 70008 is the
     // code the engine already uses for a JID in the form it did not want.
     const PEER_LEGACY: &str = "11223344556677@c.us";
 
-    let shapes: [(&str, &str, &str, Vec<String>); 1] = [(
-        "peer only",
-        PEER_LID,
-        PEER_LID,
-        vec![PEER_LID_DEVICE.to_owned()],
-    )];
+    let shapes: [(&str, &str, &str, Vec<String>); 2] = [
+        (
+            "device na lista",
+            PEER_LID,
+            PEER_LID,
+            vec![PEER_LID_DEVICE.to_owned()],
+        ),
+        (
+            "bare na lista",
+            PEER_LID,
+            PEER_LID,
+            vec![PEER_LID.to_owned()],
+        ),
+    ];
 
     for (label, peer, alt_jid, devices) in shapes {
         for hold in [false] {

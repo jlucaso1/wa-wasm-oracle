@@ -788,9 +788,23 @@ peer_participant"*. The inference it supports is only the narrow one above.
 
 What remains is which two strings differ. The engine's log says
 `wa_call_group_create_participant updating peer jid to: 6677:0@lid` — the
-*device* form — while the offer looks up by the *user* form. Device count is not
-what triggers that replacement: passing two peer devices instead of one leaves
-both the log line and the 70003 unchanged.
+*device* form — while the offer looks up by the *user* form.
+
+**The input shape is not what causes it.** Three variants all produce the same
+`updating peer jid to: 6677:0@lid` and the same 70003:
+
+| participant list | result |
+| --- | --- |
+| one device LID (`…:0@lid`) | 70003 |
+| two device LIDs (`…:0@lid`, `…:1@lid`) | 70003 |
+| a bare LID (`…@lid`, no device) | 70003 |
+
+So the engine derives the device form itself rather than taking it from what we
+pass, and it does so whatever we pass. Since a real client evidently gets past
+this line, something else must make the lookup succeed — most likely what
+`wa_call_participant_jid_get_user_jid` returns (`*(participant_jid + 0)`) is not
+the bare form it looks like. Reading that field at the moment of the call is the
+next measurement.
 
 Making `f8502_voip_assert` observable was tried and does not work yet. The idea
 fits: the gate at the top of the function is eleven bytes
