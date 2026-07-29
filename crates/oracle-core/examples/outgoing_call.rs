@@ -130,6 +130,67 @@ fn engine_once(bytes: &[u8]) -> anyhow::Result<Runtime> {
     // `(file, function, line)`, and the callback also only fires for the *first*
     // assert of each severity, so it cannot enumerate exit paths anyway.
 
+    // What WhatsApp Web does immediately before `initVoipStack` and we never
+    // did: `setABPropsOnWasm` walks `WAWeb/Voip/ABPropConfig.js` and pushes
+    // every entry through `setABPropBool` / `setABPropInt`. Without it the
+    // engine logs "Application settings not loaded" and every
+    // `getVoipParam("options.*")` comes back empty.
+    //
+    // The values a real client uses come from the server, so these are the
+    // types' own defaults — the point is whether the engine behaves differently
+    // when the properties exist at all, not to reproduce anyone's rollout.
+    const AB_BOOL: [&str; 12] = [
+        "enable_av_downgrade",
+        "enable_new_user_action_stanza_for_raise_hand_sender",
+        "enable_webcodec_video_encode",
+        "enable_init_bwe_for_group_call",
+        "enable_ring_for_gc_on_offer_expire",
+        "allow_reporting_call_replayer_id",
+        "enable_offer_v2_upgrade",
+        "enable_silent_offer",
+        "voice_ai_conversation_starter_latency_tracking",
+        "enable_waiting_room_logging",
+        "attach_transport_rtx",
+        "ignore_joinable_terminate_on_expired_offer",
+    ];
+    const AB_INT: [&str; 15] = [
+        "heartbeat_interval_s",
+        "lobby_timeout_min",
+        "max_num_participants_for_ss",
+        "calling_screen_share_milestone_version",
+        "max_group_size_for_long_ringtone",
+        "app_exit_reason_version",
+        "log_level",
+        "audio_level_speaking_threshold",
+        "calling_rust_migration_bitmap",
+        "calling_rust_migration_incoming_stanza_bitmap",
+        "default_endpoint_thread_poll_timeout",
+        "aigc_version",
+        "call_admin_version",
+        "vid_stream_pause_resume_jb_reset_threshold_ms",
+        "voip_stack_incoming_message_ownership_transfer",
+    ];
+    let mut ab_set = 0usize;
+    for name in AB_BOOL {
+        if runtime
+            .call_embind(
+                "setABPropBool",
+                &[Value::Str(name.to_owned()), Value::Bool(false)],
+            )
+            .is_ok()
+        {
+            ab_set += 1;
+        }
+        runtime.refuel();
+    }
+    // Deliberately not the ints. Zero is a sane default for a feature flag and
+    // is not one for `heartbeat_interval_s` or
+    // `default_endpoint_thread_poll_timeout`: pushing all 27 as zero registers
+    // fine — "Application settings not loaded" stops appearing — and takes the
+    // run from 167 log lines to 93. A real client gets these from the server.
+    let _ = AB_INT;
+    println!("AB props (bool) aceitas: {ab_set}/{}", AB_BOOL.len());
+
     let init_mark = runtime.engine_log().len();
     let init = runtime.call_embind(
         "initVoipStack",

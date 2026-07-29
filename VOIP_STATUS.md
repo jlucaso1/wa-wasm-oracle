@@ -841,13 +841,21 @@ and this wasm are not from the same configuration — worth knowing before readi
 that file as ground truth for argument *forms*, as opposed to argument *order*,
 which it did get right.
 
-One real gap remains between what WhatsApp Web does at init and what we do.
-Before `initVoipStack` — which takes the same three arguments we pass — it runs
-`setABPropsOnWasm`, walking `WAWeb/Voip/ABPropConfig.js` and pushing 27
-properties through `setABPropBool` / `setABPropInt` / `setABPropString`. We push
-none, and the engine says so: *"Application settings not loaded"*. None of the
-27 names is obviously about jids or LID, so this is a gap rather than a
-diagnosis.
+One real gap between what WhatsApp Web does at init and what we did is now
+closed. Before `initVoipStack` — which takes the same three arguments we pass —
+it runs `setABPropsOnWasm`, walking `WAWeb/Voip/ABPropConfig.js` and pushing 27
+properties. We pushed none, and the engine said so: *"Application settings not
+loaded"*.
+
+`outgoing_call` now pushes the twelve boolean ones. The engine accepts all of
+them, that complaint stops appearing, and the run goes from 167 log lines to
+193 — so the properties do reach it and do change what it does.
+
+**It is not the cause of 70003**, which is unchanged. And the integers are
+deliberately left out: zero is a sane default for a feature flag and is not one
+for `heartbeat_interval_s` or `default_endpoint_thread_poll_timeout`. Pushing
+all 27 as zero registers fine and takes the run *down* to 93 lines. A real client
+gets those values from the server.
 
 What remains is which two strings differ. The engine's log says
 `wa_call_group_create_participant updating peer jid to: 6677:0@lid` — the
