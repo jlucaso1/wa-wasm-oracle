@@ -308,8 +308,11 @@ VoipEvent.cpp:88 Error converting call event data to JSON:
   with number, for event: 16
 ```
 
-The engine builds event 16, the conversion throws, and the event never reaches
-the boundary at all — `on_call_event_js_sync` being a stub is downstream of a
+Event 16 is **"Call state changed"** — `oracle enum D5pLH9sfOOl 0x126348` reads
+the name table, and it is the same event the log shows as `[None -> Calling]`
+just before the failure. The most basic event of a call's lifetime, and the
+engine builds it, the conversion throws, and it never reaches the boundary at
+all — `on_call_event_js_sync` being a stub is downstream of a
 problem that happens before it. Worth finding which field of that event is a
 number where the code indexes it as an object; the empty
 `getVoipParam("options.*")` and *"Application settings not loaded"* are the
