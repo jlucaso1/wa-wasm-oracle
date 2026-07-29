@@ -796,8 +796,37 @@ the search loop reaches the comparison. `f10284` has 58 call sites — it is a
 blunt instrument, the run breaks elsewhere afterwards, and what it changed was
 something upstream of this site, not the comparison at it.
 
-The open question is now much narrower and much better posed: **what is `l1`, and
-why is its first word null?**
+### What `l1` is
+
+Straight through, by static reading rather than by guessing:
+
+    call_manager_start_dual_call(args)
+      t5 = *(args + 0)
+      wa_call_start_internal(…, p3 = t5, …)
+        l3 = p3, never reassigned
+        make_and_cache_offer(call, l3, …)
+          l11 = *(l3 + 0)      <- measured null
+
+And `*(participant_jid + 0)` is exactly what
+`f10297_wa_call_participant_jid_get_user_jid` returns. So the participant-jid
+object reaches the offer with **a null user jid**. Its device list is populated —
+the engine generates SSRCs per device from it — so the object is not empty, it is
+missing that one field. `wa_call_group_create_participant updating peer jid to:
+6677:0@lid` in the log is plausibly the engine filling in from the devices what
+the user jid did not supply.
+
+Which embind argument should have filled it is still open, and four candidates
+are already excluded — each tested, each still 70003:
+
+| what was varied | variants |
+| --- | --- |
+| participant list | one device LID, two device LIDs, a bare LID |
+| the fifth argument (`alt_jid`) | LID form, legacy `@c.us` form |
+| the lookup's jid | user form, device form |
+| `f10530`'s state filter | mask 5233, mask -8192 (accepts everything) |
+
+The legacy form was worth testing because WhatsApp Web passes
+`(g ?? h).toString({legacy: true})` there; it makes no difference here.
 
 What remains is which two strings differ. The engine's log says
 `wa_call_group_create_participant updating peer jid to: 6677:0@lid` — the
