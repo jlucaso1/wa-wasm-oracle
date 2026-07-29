@@ -558,6 +558,16 @@ with `emscripten_stack_set_limits` + `stackRestore` pointed at the pthread's own
 `{high, size}`. In the healthy baseline no worker ends at all. Raising the fuel
 bound a hundredfold changes nothing, so it is not exhaustion either.
 
+The trap is in function 12302, the thread profiler's sampler, which
+`_emscripten_thread_init` calls unconditionally at the end through `f12303(1)`.
+It reads `*(pthread + 112)` atomically, and that field is allocated by
+`_emscripten_thread_profiler_init` — which runs only when thread init's sixth
+argument is set. Passing zero there turns the consumer on and leaves the producer
+off, and the field is **measured as 0 on every worker**.
+
+Passing 1 instead does not fix it: same trap, same function, thirteen attempts
+now. So the null field is real and is not the whole story.
+
 So moving the stack does not corrupt anything and does not run out of anything:
 it puts some atomic on an address that is not aligned for it. The stack tops
 involved are 16-byte aligned (`0x832350`, `0x8a4690`), so the misalignment is
