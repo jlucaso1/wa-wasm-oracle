@@ -828,11 +828,32 @@ two agree.
 The probe only reports on runs that reach the site; the ones that stop earlier
 read 0 and say "did not run", which is exactly what the `+ 1` encoding is for.
 
+And the object in `args + 0` is built one call earlier, by the bridge itself:
+
+    l8 = f111(681, pool, peer, list, out)   <- table slot 681
+    memory.fill(frame, 0, 256)              <- the args struct, zeroed
+    memory.store32(frame, 0, l8)            <- args + 0
+    f99(682, frame + 260)                   <- call_manager_start_dual_call
+
+Slot 681 is `f1083_create_participant_jid`, which `unwasm table` names and whose
+own asserts give the source: `xplat/wa-voip/platforms/wasm/
+WaCallWebCallingBridge.cpp`. It has exactly two guards, and both are named by
+line:
+
+- **line 32** — the memory pool argument is null.
+- **line 33** — the peer string is empty **or** the device vector is empty
+  (`*(list + 0) == *(list + 4)`, begin equal to end). Note the *or*: a non-empty
+  peer with an empty list fails here too.
+
+Past both, it copies its fourth argument into its frame and calls table slot 675
+to build the user jid. That call is where to look next: the object comes back
+with its user jid field zero, and both of the guards above are satisfied by what
+we pass — the peer string is not empty and the device list has one entry.
+
 Worth noting for whoever picks this up: `wa_call_participant_jid_create_with_
 params` is called by `10603` and by `10642_call_manager_start_dual_call_from_
-context` — and **not** by `10428`, the entry point this path uses. So on this
-path nothing constructs the participant jid through the usual constructor; it
-arrives already built in the args struct.
+context` — and **not** by `10428`, the entry point this path uses. The bridge's
+own `create_participant_jid` is what builds it here.
 
 And `*(participant_jid + 0)` is exactly what
 `f10297_wa_call_participant_jid_get_user_jid` returns. So the participant-jid
