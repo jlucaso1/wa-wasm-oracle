@@ -295,33 +295,30 @@ non-deterministically at a fixed point, the 24-versus-200-line spread between
 runs of the same module, the traps inside `startVoipCall`, and workers dying on
 wild addresses.
 
-### The instruction that clears it
+### The 347 KB fill is not it — measured
 
-`wa_call_group_create_participant` zeroes **347 KB**:
+`wa_call_group_create_participant` does zero 347 KB, and again 287 KB past that:
 
 ```rust
 memory.fill(l6, 0, 347664);
 memory.fill(l6 + 59400, 0, 287864);
 ```
 
-The main thread's stack is **64 KiB** — `0x14cf60..0x24cf60`, which is what
-`emscripten_stack_init` reports — and the participant array the offer reads sits
-at `0x24bed0`, inside it. A fill that size starting anywhere near wipes the whole
-stack rather than a field.
+Against a 64 KiB main-thread stack that looked decisive. It is not. Patched to
+store its own destination instead of filling, `l6` reads **`0x960018`** on two
+runs of three — a heap address, and one that has turned up before as a
+participant object. The fill covers `0x960018..0x9b4f28`; the array at
+`0x24bed0` is nowhere near it. This is an object being initialised in the heap,
+which is what it looks like.
 
-`unwasm`'s watchpoint reaches the same function from the other direction:
-*"function #10532 wrote 4 bytes at 0x24bed0 (Fill), on thread ThreadId(3)"* — a
-worker writing into the main thread's stack. (The file offset quoted with it,
-4667241, does not hold a fill in this module — `unwasm bytes` gives
-`53 22 00 04 40 20 01 10` — so that part is worth re-checking at the source. The
-rest stands.)
+The third run read back the scratch word's pre-existing garbage while a control
+storing `-1` at the same site fired, so the site is reached and the store works —
+the site simply is not reached on every run.
 
-Which closes the chain: threads share one stack, `10532` runs on a worker and
-zeroes hundreds of kilobytes, the main thread's array at `0x24bed0` goes with it,
-`10297` is handed NULL, and `offer.cc:485` returns 70008.
-
-**Next:** read `l6` at runtime and confirm the range covers `0x24bed0`. The fix
-after that is giving threads their own stacks, which is the open question above.
+`unwasm`'s watchpoint reports the same function writing at `0x24bed0` via a Fill
+from a worker thread, and the two do not agree. The file offset it quotes,
+4667241, holds `53 22 00 04 40 20 01 10` rather than a fill. Both wanted checking
+before anything was built on them, and this is that check.
 
 ### Confirmed: every guest thread starts on the same stack
 
