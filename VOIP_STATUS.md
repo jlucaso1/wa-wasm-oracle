@@ -313,11 +313,21 @@ the name table, and it is the same event the log shows as `[None -> Calling]`
 just before the failure. The most basic event of a call's lifetime, and the
 engine builds it, the conversion throws, and it never reaches the boundary at
 all — `on_call_event_js_sync` being a stub is downstream of a
-problem that happens before it. Worth finding which field of that event is a
-number where the code indexes it as an object; the empty
-`getVoipParam("options.*")` and *"Application settings not loaded"* are the
-obvious neighbours, since both are configuration a real client is handed by the
-server.
+problem that happens before it. Traced: the JSON is built in function 11937, whose keys are `event_type`,
+`call_id`, `result` and `previous_state`, and `operator[]` is function 100. The
+throw is on the **first** access —
+
+```rust
+l10 = f11892(frame + 48832);          // the event's json
+f100(8266, l10, "event_type");        // l10["event_type"]  <- throws here
+```
+
+— so the value is already a number before any field is read, and the conversion
+dies before touching `previous_state` or the rest. That is engine-internal, built
+from the engine's own state; nothing crossing the boundary from this side
+obviously decides it. The empty `getVoipParam("options.*")` and *"Application
+settings not loaded"* remain the plausible upstream, both being configuration a
+real client is handed by the server.
 
 **And the stubs are not the problem.** `Runtime::stubs_called()` reports what the
 guest actually called, and over a full run that is one thing:
