@@ -576,8 +576,15 @@ It reads `*(pthread + 112)` atomically, and that field is allocated by
 argument is set. Passing zero there turns the consumer on and leaves the producer
 off, and the field is **measured as 0 on every worker**.
 
-Passing 1 instead does not fix it: same trap, same function, thirteen attempts
-now. So the null field is real and is not the whole story.
+Passing 1 instead does not fix it: the field becomes allocated and 4-byte
+aligned — measured, `0x64fa78` and friends — and the trap is unchanged.
+
+Zeroing the profiler's enable byte at 1358168 before the worker runs does not fix
+it either, and that one is contradictory: with the flag clear, function 12302
+returns at its first guard and cannot reach an atomic, yet it is still where all
+five workers trap. Either the write does not take or something sets the flag
+again between there and the entry point. Worth resolving before trusting any
+reading of that path.
 
 So moving the stack does not corrupt anything and does not run out of anything:
 it puts some atomic on an address that is not aligned for it. The stack tops
