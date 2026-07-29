@@ -552,6 +552,18 @@ limits cannot be reaching the main thread that way.
 With the allocation but no relocation: 202 lines, zero traps, three runs. So the
 relocation is what breaks it, whichever stack it installs.
 
+**What the traps actually say, which none of this had looked at:**
+`wasm trap: unaligned atomic` — every worker, every time, at its entry point,
+with `emscripten_stack_set_limits` + `stackRestore` pointed at the pthread's own
+`{high, size}`. In the healthy baseline no worker ends at all. Raising the fuel
+bound a hundredfold changes nothing, so it is not exhaustion either.
+
+So moving the stack does not corrupt anything and does not run out of anything:
+it puts some atomic on an address that is not aligned for it. The stack tops
+involved are 16-byte aligned (`0x832350`, `0x8a4690`), so the misalignment is
+downstream of the stack rather than in it — TLS or a lock whose address derives
+from it are the obvious candidates.
+
 **Do not re-run those five.** Diffing a 24-line log against a healthy one says
 where it goes: the run dies **inside `initVoipStack`**, not on the call path. Its
 last lines are media init —
