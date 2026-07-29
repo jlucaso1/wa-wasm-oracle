@@ -1030,13 +1030,17 @@ fn the_engine_starts_an_outgoing_call() {
             "the call should enter the Calling state: {lines:?}"
         );
 
-        // And then it stops, in a known place. This pins the blocker rather
-        // than endorsing it: `make_and_cache_offer` (offer.cc) returns 70008 at
-        // line 463, where it checks `wa_call_group_get_self_participant` — the
-        // call's participant group has peers but no *self*, so the engine
-        // cannot build an offer to send. Nothing reaches the wire because
-        // nothing is ever built, which is why chasing the outbound channel for
-        // so long found nothing wrong with it.
+        // And then it stops. This pins the blocker rather than endorsing it:
+        // `make_and_cache_offer` (offer.cc) returns 70008.
+        //
+        // *Which* of its nine `70008` sites fires is not known. It is not
+        // `offer.cc:463`, the missing-self-participant one, though that was
+        // written here as established: with the engine's workers alive,
+        // `getCallInfo` answers, and it reports `participant_count: 2` with
+        // `11223344556677@lid` as `is_self: false` and `99887766554433@lid` as
+        // `is_self: true`. The self participant exists. Neither of the two
+        // functions that build it logs its "self participant not created"
+        // failure, either. See VOIP_STATUS.md for the remaining candidates.
         //
         // When this assertion starts failing, the blocker is gone: replace it
         // with one that expects an offer on the wire.
