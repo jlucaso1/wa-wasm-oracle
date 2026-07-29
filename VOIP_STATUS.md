@@ -387,9 +387,17 @@ load-bearing, since it is the reason nothing sets one.
 
 The participant array sits at `0x24bed0`, 4240 bytes below that shared top.
 
-Reading it needs the right export name: this module exports globals
-positionally, `__global_0` upward, with no `__stack_pointer`. Global 0 is the
-stack pointer.
+**Reading a global needs a patched module, and mistaking that for a zero is
+easy.** The capture in `docs/captured-js/wasm` exports **no globals at all** —
+`wasm-tools` finds zero. `scripts/export_globals.py` writes a copy that does, and
+the probe was built for that copy; run against the original, `get_export
+("__global_0")` returns nothing, and code that falls back to `0` reports a zero
+where it should report "not available". Anything below that reads a global was
+measured on the patched copy, and the stack pointer is global 0.
+
+`pthread_self` is `global.get 3`, so the pthread pointer is global 3 — worth
+knowing, because reading `__global_3` on the original returns nothing and looks
+like a null pthread.
 
 ### The obvious fix does not work
 
