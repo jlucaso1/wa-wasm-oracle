@@ -803,11 +803,20 @@ What remains is which two strings differ. The engine's log says
 | a bare LID (`…@lid`, no device) | 70003 |
 
 So the engine derives the device form itself rather than taking it from what we
-pass, and it does so whatever we pass. Since a real client evidently gets past
-this line, something else must make the lookup succeed — most likely what
-`wa_call_participant_jid_get_user_jid` returns (`*(participant_jid + 0)`) is not
-the bare form it looks like. Reading that field at the moment of the call is the
-next measurement.
+pass, and it does so whatever we pass.
+
+**And the mismatch is not user-versus-device either.** The lookup's argument can
+be changed without touching anything else: `l15 = get_user_jid(l11)` is a
+three-byte `call` at `0x4dc35f`, and replacing it with three `nop`s leaves the
+participant jid itself on the stack, so `l15 = l11` and the lookup runs against
+the *device* form instead. Three runs, still 70003.
+
+So `get_participant` matches neither form. Together with the earlier result —
+the loop does reach the comparison — the group holds at least one live entry
+whose jid string equals neither the user nor the device form of what the offer
+is holding. Which two strings those actually are is still the open question, and
+answering it needs somewhere to put them: see the note above on why an address
+with no `i32.const` is not free.
 
 Making `f8502_voip_assert` observable was tried and does not work yet. The idea
 fits: the gate at the top of the function is eleven bytes
