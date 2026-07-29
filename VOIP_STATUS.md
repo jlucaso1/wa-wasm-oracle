@@ -649,6 +649,42 @@ knowing:
   — silence that reads as "nothing to report". `stackSave` answers the same
   question through an export that actually exists, and `threads.rs` now uses it.
 
+### The thread-status profiler was the blocker
+
+`f12302` is emscripten's `emscripten_conditional_set_current_thread_status`,
+reached from the futex wait path every engine worker sits in. Its first act is
+to read a byte at `0x14B958` and return if it is zero — the profiler flag. Its
+only writer is `emscripten_thread_profiler_enable` (`f13134`), which `unwasm`
+reports with **zero call sites and zero table slots**: nothing in this module
+ever calls it. The flag reads zero before a worker enters its routine, and zero
+again after the one worker that returns cleanly has finished.
+
+Forcing that test to fail — the guard's `i32.load8_u` becomes `drop; i32.const
+0`, same three bytes, `scripts/neutralize_thread_profiler.py` — changes the run
+from **27 engine log lines and eleven traps to 167 lines and none**, three runs.
+
+That is a proof by construction, and it settles two things at once. The patch
+only has an effect if the flag was non-zero, so **static data at `0x14B958` is
+corrupted at runtime**; that is no longer a hypothesis. And the same corruption
+is what leaves an out-of-linear-memory pointer in `pthread + 112`, which is
+where the traps land. One bug, two symptoms, and neither is the stack.
+
+The patch is an instrument, not a fix. It masks a symptom so the engine can be
+studied; anything measured against a patched capture has to say so.
+
+### What the engine does once its workers survive
+
+It gets all the way to the offer. It generates SSRCs per participant for
+**audio, video and screen-share** streams, emits `EVENT: Call state changed`,
+and then:
+
+    core/call_ 001  wa_call_start_internal, make_and_cache_offer failed: 70008
+    events/ev 0011  EVENT: Call offer send failed
+
+So the blocker is no longer "the workers die". It is a nameable error out of
+`f11198_make_and_cache_offer`, with the whole participant and stream setup
+visible in the log ahead of it.
+
 So moving the stack does not corrupt anything and does not run out of anything:
 it puts some atomic on an address that is not aligned for it. The stack tops
 involved are 16-byte aligned (`0x832350`, `0x8a4690`), so the misalignment is
