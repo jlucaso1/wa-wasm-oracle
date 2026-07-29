@@ -875,7 +875,7 @@ and neither step is the failure:
 So the participant jid is built, from a parse that understands `@lid`, out of a
 heap allocation that succeeded — and the field still reaches the offer as zero.
 
-### A hypothesis, labelled as one: the object is a dead stack temporary
+### A hypothesis that was labelled as one, and then refuted
 
 The arithmetic fits, which is exactly why it is written here as a hypothesis.
 `start_call_md` takes `frame = g0 - 4176` and `create_participant_jid` takes
@@ -890,12 +890,19 @@ If that holds, the pointer `args + 0` carries is a temporary in the frame of a
 function that has already returned by the time `make_and_cache_offer` reads it,
 and the zero is whatever later reused that stack.
 
-**Do not treat this as established.** An earlier section of this file argued from
-arithmetic that fitted just as well — the pthread sitting 8992 bytes below a
-stack's low end — and a control killed it. What would settle this one: probe
-`*(l3 + 0)` *inside* `create_participant_jid`, before it returns, and compare
-with the same field at `offer.cc:485`. Non-zero there and zero here proves it;
-zero in both places refutes it.
+**It is refuted, and by the cheapest possible test.** The assert at
+`offer.cc:485` fires, so its sixteen bytes execute — enough to store the stack
+pointer itself (`i32.const SCRATCH; global.get 0; i32.const 1; i32.add;
+i32.store`). At the moment of the failure the stack pointer is **`0x24b8c0`**,
+three runs, deterministic. The stack grows down, so everything above the pointer
+is live frames — and `0x24bed0` is above it by 1552 bytes. The object is inside a
+frame that is still on the stack, not in space that has been given back.
+
+So it is a live object whose user-jid field is genuinely zero, and the
+arithmetic above fitted a story that was not happening. That is twice in this
+file that a frame-offset calculation has looked conclusive and been wrong; the
+lesson is not to stop calculating but to keep labelling it until a control
+agrees.
 
 Note the probe technique has a limit worth knowing: a `voip_assert` call site is
 only free real estate when the assert actually fires. `offer.cc:485` works
