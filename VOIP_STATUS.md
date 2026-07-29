@@ -828,6 +828,27 @@ are already excluded — each tested, each still 70003:
 The legacy form was worth testing because WhatsApp Web passes
 `(g ?? h).toString({legacy: true})` there; it makes no difference here.
 
+**And the first argument cannot be the legacy form in this build, even though
+WhatsApp Web sends it that way.** `StackInterfaceWeb.js` is unambiguous:
+
+    s.startVoipCall(e.toString({ legacy: !0 }), u, n, r, a, i, c);
+
+so the peer goes in legacy form and only the participant list `u` is LID.
+Passing `11223344556677@c.us` there gets the call rejected outright, in 30 log
+lines: *"start_precall peer_participant_jids must be LID, enforce LID for all
+calls"*. This capture enforces LID on the peer argument too, so the captured JS
+and this wasm are not from the same configuration — worth knowing before reading
+that file as ground truth for argument *forms*, as opposed to argument *order*,
+which it did get right.
+
+One real gap remains between what WhatsApp Web does at init and what we do.
+Before `initVoipStack` — which takes the same three arguments we pass — it runs
+`setABPropsOnWasm`, walking `WAWeb/Voip/ABPropConfig.js` and pushing 27
+properties through `setABPropBool` / `setABPropInt` / `setABPropString`. We push
+none, and the engine says so: *"Application settings not loaded"*. None of the
+27 names is obviously about jids or LID, so this is a gap rather than a
+diagnosis.
+
 What remains is which two strings differ. The engine's log says
 `wa_call_group_create_participant updating peer jid to: 6677:0@lid` — the
 *device* form — while the offer looks up by the *user* form.
