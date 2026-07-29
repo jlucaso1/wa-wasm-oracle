@@ -329,6 +329,13 @@ obviously decides it. The empty `getVoipParam("options.*")` and *"Application
 settings not loaded"* remain the plausible upstream, both being configuration a
 real client is handed by the server.
 
+**Determinism is load-dependent, and the earlier claim needs that caveat.**
+Registering the main thread gave 167 engine-log lines on every run of an idle
+machine, which read as determinism. Under load — a compiler and another engine
+running alongside — three runs in four die at 26-27 lines again. So registration
+removes a large source of variance without removing the variance, and any
+measurement here still wants several runs and a note on what else was running.
+
 **And the stubs are not the problem.** `Runtime::stubs_called()` reports what the
 guest actually called, and over a full run that is one thing:
 `env::emscripten_check_blocking_allowed`, once. Invented answers barely touch
