@@ -772,10 +772,25 @@ mask.)
 
 So `get_participant` finds nothing. It walks the group's participants comparing
 with `f10284`, which is a **textual** comparison — `pj_strcmp` on the `pj_str` at
-offset +8 of each jid. The offer looks up by *user* jid; the engine's own log
-says `wa_call_group_create_participant updating peer jid to: 6677:0@lid`, the
-*device* form. That is the shape of the mismatch, and confirming it means
-reading the two strings that reach `f10284`.
+offset +8 of each jid.
+
+**The walk reaches the comparison, and the comparison is what fails.** Those are
+two different failures — a participant count of zero skips the loop entirely and
+returns null without comparing anything — and patching `f10284` to return 1
+unconditionally (its first five bytes, `local.get 0; local.get 1; i32.eq`, become
+`i32.const 1; return; nop; nop`) tells them apart: `make_and_cache_offer failed:
+70003` disappears. If the loop never ran, forcing the comparator could not have
+changed the outcome.
+
+That patch is a blunt instrument — `f10284` has 58 call sites, so the run then
+breaks elsewhere, at *"Call ending without valid self_participant or
+peer_participant"*. The inference it supports is only the narrow one above.
+
+What remains is which two strings differ. The engine's log says
+`wa_call_group_create_participant updating peer jid to: 6677:0@lid` — the
+*device* form — while the offer looks up by the *user* form. Device count is not
+what triggers that replacement: passing two peer devices instead of one leaves
+both the log line and the 70003 unchanged.
 
 Making `f8502_voip_assert` observable was tried and does not work yet. The idea
 fits: the gate at the top of the function is eleven bytes
