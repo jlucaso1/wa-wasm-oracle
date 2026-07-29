@@ -609,12 +609,13 @@ plain `i32.load` — same four bytes — says what**: the trap becomes *out of b
 memory access*, five times, at the same address. So the pointer is not merely
 unaligned, it is outside linear memory. Garbage.
 
-And the arithmetic points at where the garbage comes from. Worker 1's pthread
-sits at `0x820030`; the stack its own struct names runs `0x822350..0x832350`. The
-struct is **8992 bytes below the stack's low end**, so a thread that overruns its
-64 KiB writes over its own pthread — `+112` included. That accounts for the whole
-shape: the field is fine at init, garbage by the time the sampler reads it, and
-only when the stack has been moved somewhere with the struct beneath it.
+Where the garbage comes from is still open, and one appealing answer is already
+wrong. Worker 1's pthread sits at `0x820030` and the stack its struct names runs
+`0x822350..0x832350`, leaving the struct 8992 bytes below the stack's low end —
+which reads like a 64 KiB overrun writing over its own pthread. It is not:
+installing a **1 MiB stack from the heap**, nowhere near the struct, fails in
+exactly the same way, same traps, three runs. So the field is corrupted by
+something that is not the thread overrunning its own stack.
 
 So moving the stack does not corrupt anything and does not run out of anything:
 it puts some atomic on an address that is not aligned for it. The stack tops
