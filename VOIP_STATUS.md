@@ -714,6 +714,33 @@ byte at 1351084 *and* a callback slot at 1351212 that nothing ever fills — so
 naming the site means making `f8502_voip_assert` observable, or re-running the
 unique-site instrumentation on `offer.cc:485` now that the workers survive.
 
+Making `f8502_voip_assert` observable was tried and does not work yet. The idea
+fits: the gate at the top of the function is eleven bytes
+(`i32.const 1351084; i32.load8_u; i32.eqz; br_if 0`), which is exactly enough for
+`i32.const SCRATCH; local.get 3; i32.store; br 0` — record the line argument and
+leave the same way the disabled gate did. The signature is confirmed:
+`f8502_voip_assert(p0, file, func, line)`, so `local.get 3` is the line.
+
+It produced a contradiction that is not resolved:
+
+- The store never lands. The scratch word still holds its initialised data
+  (`0x37340034`) after a run, so `voip_assert` was seemingly never called before
+  the host reads.
+- Yet the run regresses from 167 engine log lines to 63, identically for two
+  different scratch addresses — so the *control-flow* half of the patch does
+  matter, which requires `voip_assert` to have been called.
+
+Both cannot be true as stated, so one of the two measurements is wrong. Worth
+keeping either way: finding a free scratch word took two wrong answers, and
+neither is obvious.
+
+- **A low address like 40 is not scratch, it is emscripten's.** On an unpatched
+  capture that word already holds `0xFAE5C6B7` by the end of a call.
+- **The assert's own callback slot at 1351212 reads as zero, which looks free**,
+  but `f10347_update_voip_params_in_use2` also addresses it.
+- `unwasm constants <module> <address>` answers "does anything address this
+  word" directly, and 1351220 is addressed by nothing in the module.
+
 So moving the stack does not corrupt anything and does not run out of anything:
 it puts some atomic on an address that is not aligned for it. The stack tops
 involved are 16-byte aligned (`0x832350`, `0x8a4690`), so the misalignment is
