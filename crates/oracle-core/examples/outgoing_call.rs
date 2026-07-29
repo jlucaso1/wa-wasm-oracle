@@ -60,6 +60,12 @@ fn engine(bytes: &[u8]) -> anyhow::Result<Runtime> {
     // against a baseline that wandered between 24 and 202 — and the proxy queue
     // has a thread that may drain it, which is where the engine dispatches
     // outgoing signaling. The offer still fails; this is not that fix.
+    //
+    // It is a trade, not a free win: turning it on in `tests/signaling.rs` made
+    // `a_well_formed_offer_is_accepted` and
+    // `the_engine_reports_a_self_participant_for_an_outgoing_call` trap on the
+    // `getCallInfo` path, so that was reverted. Whatever registration changes
+    // for the better here, it changes something else for the worse there.
     runtime.set_main_thread_registration(true);
     runtime.run_ctors()?;
     runtime.attach_log_ring(4 << 20)?;
