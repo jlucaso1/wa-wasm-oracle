@@ -209,8 +209,9 @@ impl HostState {
 impl HostState {
     /// Reads `len` bytes of linear memory.
     ///
-    /// The module runs single-threaded here, so nothing mutates the shared
-    /// memory concurrently with this read.
+    /// What keeps this exclusive is `schedule.rs`, not the absence of threads:
+    /// `ThreadPolicy::Spawn` runs real guest threads over one shared memory, and
+    /// the scheduler is what holds all but one of them outside guest code.
     #[allow(unsafe_code)]
     pub fn read(&self, ptr: u32, len: u32) -> Result<Vec<u8>> {
         let start = ptr as usize;
@@ -227,9 +228,18 @@ impl HostState {
                 ));
             }
             // SAFETY: wasmtime exposes shared memory as UnsafeCell because
-            // another thread could write to it. This runtime never starts a
-            // second thread — pthread_create is refused — so there is no
-            // concurrent writer, and the bounds are checked above.
+            // another thread could write to it. Bounds are checked above, and
+            // the accesses are per-byte through the cell, so no reference to
+            // the memory is formed and no typed invariant can be broken.
+            //
+            // Exclusion comes from the scheduler: a guest thread only runs
+            // while it holds the turn, and it holds the turn across the host
+            // call this read happens inside. That is bounded rather than
+            // absolute — `schedule.rs` lets a thread take its turn after
+            // TURN_TIMEOUT rather than deadlock, and `threads.rs` deliberately
+            // watches a word another thread is writing. Past that point a read
+            // can tear and return a mix of old and new bytes. `forced_turns()`
+            // counts it, and the startup guard keeps it at zero.
             return Ok(unsafe { data[start..end].iter().map(|cell| *cell.get()).collect() });
         }
 
@@ -277,8 +287,9 @@ impl HostState {
             if end > data.len() {
                 return Err(anyhow!("write at {ptr}+{} is out of bounds", bytes.len()));
             }
-            // SAFETY: same single-threaded argument as `read`, and the range is
-            // checked above. The guest gave us this pointer to write through.
+            // SAFETY: same argument as `read` — per-byte through the cell,
+            // range checked above, exclusion from the scheduler — and the guest
+            // gave us this pointer to write through.
             unsafe {
                 for (cell, byte) in data[start..end].iter().zip(bytes) {
                     *cell.get() = *byte;
