@@ -1141,10 +1141,16 @@ and zero bounds are what put the workers on wild addresses.
 | `signaling --ignored` | **23 passed** | **21 passed, 2 failed** |
 
 The minimal probe says the change fixes something; the full suite says it breaks
-two things. The tie-break is *what* breaks, and it is the same trap in both
-columns: `f1139` (`startVoipCall`'s embind wrapper) → `f763` → `f13513` →
-`f13089`, a container destructor handing `free` a pointer it refuses. Four
-attempts out of four in `the_engine_starts_an_outgoing_call`, and the other
+two things. The tie-break is *what* breaks — and it is **the same trap in both
+columns, only in a different run**:
+
+    f1139   startVoipCall's embind wrapper
+    f763    a container destructor
+    f13513
+    f13089  free, refusing the pointer it was handed
+
+Shared stack, that is `profiler_flag.rs`. Own stacks, that is
+`the_engine_starts_an_outgoing_call`, four attempts out of four. The second
 failure is offer-then-call filling the log ring with 880 unstructured lines.
 
 **So the heap corruption behind that trap is not the shared stack.** Moving the
