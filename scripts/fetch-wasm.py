@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Fetch the captured modules this oracle runs against into ./wasm.
 
-The modules are WhatsApp's artifacts and are not vendored here. They are
-published as `wasm-*.tar.xz` release assets, and `wasm.lock.json` names the six
-this repository needs together with their SHA-256s and the releases that carry
-them.
+The modules are WhatsApp's artifacts and are not vendored here. `wasm.lock.json`
+names the six this repository needs, each with its SHA-256 and the CDN url it
+was captured from, followed by the releases that carry `wasm-*.tar.xz` archives
+of the same bytes.
+
+The origin url is tried first. WhatsApp's CDN still serves these exact bytes
+long after the rollout that produced them, it needs no token, and it costs one
+request per module rather than a whole archive. The releases are the fallback
+for the day a capture rolls off it.
 
 Pinning by hash rather than by whatever WhatsApp serves today is deliberate.
 Every function index, table slot and absolute address recorded in README.md and
@@ -84,10 +89,15 @@ def token() -> str | None:
     return found.stdout.strip() or None
 
 
-def get(url: str, accept: str) -> bytes:
+def get(url: str, accept: str, authenticate: bool = False) -> bytes:
+    """Fetches a url, sending our token only where it belongs.
+
+    `authenticate` is off by default and set only for GitHub: the origin CDN is
+    a third party, and a token offered to one is a token disclosed to it.
+    """
     request = urllib.request.Request(url)
     request.add_header("Accept", accept)
-    if TOKEN:
+    if authenticate and TOKEN:
         request.add_header("Authorization", f"Bearer {TOKEN}")
     with OPENER.open(request) as response:
         return response.read()
@@ -137,6 +147,35 @@ def take_from(archive: bytes, missing: dict, dest: Path, label: str) -> None:
             del missing[name]
 
 
+def take_from_origin(missing: dict, dest: Path) -> None:
+    """Downloads whichever wanted modules the CDN still serves, by hash.
+
+    A mismatch here means the url now answers with a later capture, which is a
+    different binary and not an update — it is reported and left on the ground
+    for the release archives below to satisfy.
+    """
+    for name, module in list(missing.items()):
+        url = module.get("url")
+        if not url:
+            continue
+        try:
+            payload = get(url, "application/octet-stream")
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as error:
+            print(f"    {name}: {error}", file=sys.stderr)
+            continue
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != module["sha256"]:
+            print(
+                f"    {name} at the origin is a different capture "
+                f"(sha256 {digest[:12]}…, lock says {module['sha256'][:12]}…)",
+                file=sys.stderr,
+            )
+            continue
+        (dest / name).write_bytes(payload)
+        print(f"    {name}  {len(payload)} bytes  ok")
+        del missing[name]
+
+
 def main() -> int:
     lock = json.loads(LOCK.read_text())
     modules = lock["modules"]
@@ -152,6 +191,10 @@ def main() -> int:
 
     print(f"need {len(missing)} of {len(wanted)}: {', '.join(sorted(missing))}")
 
+    if any(module.get("url") for module in missing.values()):
+        print("  static.whatsapp.net — the capture's own origin")
+        take_from_origin(missing, dest)
+
     for source in lock["sources"]:
         if not missing:
             break
@@ -159,7 +202,9 @@ def main() -> int:
         print(f"  {repo} @ {tag}")
         url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
         try:
-            release = json.loads(get(url, "application/vnd.github+json"))
+            release = json.loads(
+                get(url, "application/vnd.github+json", authenticate=True)
+            )
         except urllib.error.HTTPError as error:
             reason = "not found or not readable with this token" if error.code in (
                 403,
@@ -184,7 +229,9 @@ def main() -> int:
             try:
                 # The API url rather than browser_download_url: this one honours
                 # the token, which a private release needs.
-                archive = get(asset["url"], "application/octet-stream")
+                archive = get(
+                    asset["url"], "application/octet-stream", authenticate=True
+                )
             except urllib.error.HTTPError as error:
                 print(f"    skipped {asset['name']}: {error}", file=sys.stderr)
                 continue

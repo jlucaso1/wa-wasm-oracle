@@ -24,15 +24,25 @@ cargo build --release             # always --release; see below
 cargo test --release -- --nocapture
 ```
 
-`fetch-wasm.py` reads `wasm.lock.json`, walks the releases it names, and refuses
-any payload whose SHA-256 does not match. Two sources, tried in order:
+`fetch-wasm.py` reads `wasm.lock.json` and refuses any payload whose SHA-256
+does not match. Three sources, tried in order:
 
+- **`static.whatsapp.net` — the capture's own origin**, one url per module,
+  recorded in the lock. WhatsApp's CDN still serves the pinned 2025-05-27 bytes,
+  all six verifying against the hashes here, so a clone with no credentials at
+  all gets the full set from where the capture was taken. The path segment after
+  `rsrc.php` is part of the address, not decoration: the same file under a
+  different one is a 403.
 - [oxidezap/whatspec](https://github.com/oxidezap/whatspec) `bundle-store` —
   public, and carries whatever set the current WhatsApp rollout serves. Four of
-  the six modules come from here.
+  the six modules are in its current set.
 - `jlucaso1/wa-wasm-oracle` `captured-modules` — private, and carries the VoIP
   engine and MP4 core, which whatspec's rolling set no longer has. Needs a
   token: `GITHUB_TOKEN`, or a `gh auth login` the script can borrow from.
+
+The release archives are the fallback for the day a capture rolls off the CDN;
+until then nothing but network access is needed. The token is offered to GitHub
+only — a token sent to the CDN would be a credential disclosed to a third party.
 
 The oracle then finds `wasm/` on its own; `WA_WASM_DIR` or `--dir` override the
 lookup, and a whatsapp-rust checkout with `docs/captured-js/wasm/` next to this
