@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
 
 env:
@@ -29,53 +29,51 @@ jobs:
       - name: clippy
         run: cargo clippy --all --tests -- -D warnings
 
+      # Pinned to a tag rather than @main: this is a third-party action running
+      # in a job that holds a token for a private repository, and @main is
+      # whatever that branch happens to be at the moment the job starts.
       - name: unused dependencies
-        uses: bnjbvr/cargo-machete@main
+        uses: bnjbvr/cargo-machete@v0.9.2
 
   test:
     name: tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: wa-wasm-oracle
-
-      # The captured modules live in the whatsapp-rust checkout, and the tests
-      # look for it as a sibling. Without it every test skips — which passes,
-      # and proves nothing. The step below refuses that outcome.
-      - uses: actions/checkout@v4
-        continue-on-error: true
-        with:
-          repository: oxidezap/whatsapp-rust
-          path: whatsapp-rust
-
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # Keyed on the lock: the pinned set is content-addressed, so a cache hit
+      # can only ever be the same bytes, and fetch-wasm.py re-verifies them
+      # anyway before deciding there is nothing to download.
+      - uses: actions/cache@v4
         with:
-          workspaces: wa-wasm-oracle
+          path: wasm
+          key: wasm-${{ hashFiles('wasm.lock.json') }}
+
+      # Not allowed to fail. Every test in this repository skips without the
+      # captures, and a skipped run reports success while proving nothing —
+      # which is exactly what this job did for as long as it looked for them in
+      # a whatsapp-rust checkout that never carried them.
+      - name: fetch captured modules
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/fetch-wasm.py
 
       - name: build
-        working-directory: wa-wasm-oracle
         run: cargo build --release --all-targets
 
       - name: test
-        working-directory: wa-wasm-oracle
         run: cargo test --release -- --nocapture 2>&1 | tee test-output.txt
 
-      # A skipped test reports success. When the capture is present, a skip
-      # means the tests silently stopped covering the thing they exist for, so
-      # it is treated as a failure rather than as a warning.
+      # The captures are present by now or the job already failed, so a skip
+      # here means a test quietly stopped covering the thing it exists for.
       - name: reject silent skips
-        working-directory: wa-wasm-oracle
         run: |
-          if [ -d ../whatsapp-rust/docs/captured-js/wasm ]; then
-            if grep -q "skipping:" test-output.txt; then
-              echo "Tests skipped while the capture was available:"
-              grep "skipping:" test-output.txt
-              exit 1
-            fi
-          else
-            echo "::warning::capture unavailable, tests ran in skip mode"
+          if grep -q "skipping:" test-output.txt; then
+            echo "Tests skipped while the capture was available:"
+            grep "skipping:" test-output.txt
+            exit 1
           fi
 
   # The signaling tests bring up PJSIP's worker pool: reliable under host-driven
@@ -86,20 +84,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: wa-wasm-oracle
-      - uses: actions/checkout@v4
-        continue-on-error: true
-        with:
-          repository: oxidezap/whatsapp-rust
-          path: whatsapp-rust
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
         with:
-          workspaces: wa-wasm-oracle
+          path: wasm
+          key: wasm-${{ hashFiles('wasm.lock.json') }}
+      - name: fetch captured modules
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/fetch-wasm.py
 
-      - working-directory: wa-wasm-oracle
-        run: cargo test --release --test signaling -- --ignored --test-threads 1
+      - run: cargo test --release --test signaling -- --ignored --test-threads 1
 
   # The threaded tests bring up PJSIP's worker pool and hold a serialisation
   # lock, so they are slow but not flaky. Run repeatedly: the engine has a
@@ -110,20 +106,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: wa-wasm-oracle
-      - uses: actions/checkout@v4
-        continue-on-error: true
-        with:
-          repository: oxidezap/whatsapp-rust
-          path: whatsapp-rust
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
         with:
-          workspaces: wa-wasm-oracle
+          path: wasm
+          key: wasm-${{ hashFiles('wasm.lock.json') }}
+      - name: fetch captured modules
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/fetch-wasm.py
 
-      - working-directory: wa-wasm-oracle
-        run: |
+      - run: |
           for attempt in 1 2 3; do
             echo "--- run $attempt ---"
             cargo test --release --test threading || exit 1

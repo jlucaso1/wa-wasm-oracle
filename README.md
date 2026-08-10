@@ -12,9 +12,63 @@ $ oracle embind D5pLH9sfOOl
 37 types, 206 functions, 3 classes, 30 methods
 ```
 
-The modules are not vendored. They live in the whatsapp-rust checkout under
-`docs/captured-js/wasm/`; this tool walks up to find that directory, or takes
-`WA_WASM_DIR` / `--dir`.
+The modules are not vendored — they are WhatsApp's artifacts, and a copy
+committed here would drift from the capture every offset in this file was read
+out of.
+
+## Getting set up
+
+```sh
+python3 scripts/fetch-wasm.py     # captured modules -> ./wasm, checked by hash
+cargo build --release             # always --release; see below
+cargo test --release -- --nocapture
+```
+
+`fetch-wasm.py` reads `wasm.lock.json`, walks the releases it names, and refuses
+any payload whose SHA-256 does not match. Two sources, tried in order:
+
+- [oxidezap/whatspec](https://github.com/oxidezap/whatspec) `bundle-store` —
+  public, and carries whatever set the current WhatsApp rollout serves. Four of
+  the six modules come from here.
+- `jlucaso1/wa-wasm-oracle` `captured-modules` — private, and carries the VoIP
+  engine and MP4 core, which whatspec's rolling set no longer has. Needs a
+  token: `GITHUB_TOKEN`, or a `gh auth login` the script can borrow from.
+
+The oracle then finds `wasm/` on its own; `WA_WASM_DIR` or `--dir` override the
+lookup, and a whatsapp-rust checkout with `docs/captured-js/wasm/` next to this
+one still works as a fallback.
+
+**Always `--release`.** In a debug build Cranelift compiles the 9.3 MiB VoIP
+module so slowly that a run looks hung.
+
+Tests skip when a module they need is absent, and **a skipped run is not a
+passing run** — check for `skipping:` in the output before trusting green.
+
+### Following a capture forward
+
+WhatsApp renames these files on every rollout, so the ids below are the capture
+of 2025-05-27 and nothing more permanent than that. whatspec tracks the current
+set in `generated/wasm.lock.json` and publishes it, which is how a newer module
+is obtained: read that lock, take the id whose size and imports match the one
+you want, and add it here.
+
+What does *not* carry over is everything read out of the old bytes. The module
+behind a name stays the same program; it is not the same binary. Measured
+against the current set:
+
+| | pinned here | current whatspec set |
+| --- | --- | --- |
+| VoIP engine | `D5pLH9sfOOl`, 9,794,866 B, 206 embind functions | `S_ivh1PriOA`, 10,856,103 B, 214 |
+| MP4 core | `9Nbh3eMuVjD`, 2,985,612 B | `GtsvNqhytbm`, 3,698,978 B |
+
+The newer engine comes up under this host environment and registers its API, so
+the *harness* moves forward unchanged. The recorded positions do not:
+`abi_inference.rs` asks for `infer_index(&bytes, 10_347)` and
+`signaling.rs` reads absolute address `1_352_840` — running the suite against
+the newer engine fails the first of those, and the reads that still succeed are
+answering about different code. Treat a capture bump as a re-derivation of every
+index, slot and address in the tests, `README.md` and `VOIP_STATUS.md`, and
+bump the lock only once that is done.
 
 ## Usage
 
@@ -566,3 +620,13 @@ python3 scripts/export_globals.py <src.wasm> <out.wasm> <global-count>
 # since the call context is reachable from guest code alone.
 runtime.call_embind("getCallInfo", &[])
 ```
+
+## Licence and scope
+
+The code here is dual-licensed under [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option.
+
+That covers this harness only. The captured `.wasm` modules it loads are
+WhatsApp's, are not redistributed by this repository, and are not covered by
+either licence. This is an independent interoperability and protocol-research
+tool; it is not affiliated with, authorised by, or endorsed by WhatsApp or Meta.

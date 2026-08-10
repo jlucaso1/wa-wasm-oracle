@@ -21,9 +21,18 @@ A skipped run is not a passing run: check for `skipping:` in
 
 ## Where the modules come from
 
-`docs/captured-js/wasm/` in the whatsapp-rust checkout. Do not copy them here —
-a second copy drifts from the capture the protocol docs refer to. `WA_WASM_DIR`
-overrides the lookup.
+`python3 scripts/fetch-wasm.py` puts them in `wasm/`, pulled from the whatspec
+`bundle-store` release and verified against the SHA-256s in `wasm.lock.json`.
+Do not commit them — a copy in the repository drifts from the capture the
+protocol notes refer to. `WA_WASM_DIR` overrides the lookup, and a sibling
+whatsapp-rust checkout with `docs/captured-js/wasm/` still works.
+
+**The lock pins hashes, not the latest capture, and that is the point.** Every
+function index and absolute address in `README.md`, `VOIP_STATUS.md` and the
+tests — `infer_index(&bytes, 10_347)`, `read(1_352_840, 4)` — was read out of
+these exact bytes. Repointing the lock at a newer WhatsApp module invalidates
+all of them at once, silently: the reads still succeed, they just answer about
+different code. Treat a capture bump as a re-derivation, never as an update.
 
 ## Ground rules
 

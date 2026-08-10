@@ -1,1 +1,9 @@
 /target
+
+# Captured modules, fetched by scripts/fetch-wasm.sh. Never vendored: they are
+# WhatsApp's artifacts, and a copy in git would drift from the lock that pins
+# them by hash.
+/wasm/
+
+__pycache__/
+*.pyc
