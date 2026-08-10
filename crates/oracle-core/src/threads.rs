@@ -134,6 +134,147 @@ impl Spawner {
     }
 }
 
+/// Offset of `stack` in emscripten's `struct pthread` — the *top* of the
+/// thread's stack, since wasm stacks grow down.
+///
+/// Measured rather than assumed: every worker in this capture reports a
+/// distinct value here and `0x10000` at `STACK_SIZE`, which is what the guest's
+/// own `pthread_create` allocated for it.
+const STACK_HIGH: u32 = 52;
+
+/// Offset of `stack_size` in the same structure.
+const STACK_SIZE: u32 = 56;
+
+/// Reads a guest `u32`, or `None` if the address is out of bounds.
+///
+/// The read is of memory another thread may be writing. That is the point —
+/// this is how the host watches for `pthread_create` to finish filling in a
+/// control block it does not own.
+fn read_u32(store: &Store<HostState>, at: u32) -> Option<u32> {
+    let memory = store.data().memory.as_ref()?;
+    let data = memory.data();
+    let bytes = data.get(at as usize..at as usize + 4)?;
+    // SAFETY: a racy read of shared memory, deliberately. Each cell is read
+    // once and the result is only ever treated as a hint that is then range
+    // checked, so a torn value cannot become a wild pointer.
+    #[allow(unsafe_code)]
+    let word: Vec<u8> = bytes.iter().map(|cell| unsafe { *cell.get() }).collect();
+    Some(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+}
+
+/// Gives this thread the stack its `struct pthread` says it owns.
+///
+/// This is emscripten's `establishStackSpace`, which the web build runs on
+/// every worker between `__emscripten_thread_init` and the entry point:
+///
+/// ```js
+/// var stackHigh = HEAPU32[(pthread_ptr + 52) >> 2];
+/// var stackSize = HEAPU32[(pthread_ptr + 56) >> 2];
+/// _emscripten_stack_set_limits(stackHigh, stackHigh - stackSize);
+/// stackRestore(stackHigh);
+/// ```
+///
+/// **Without it every guest thread runs on the main thread's stack.** The stack
+/// pointer is a *per-instance* global and a thread is a separate instance, so
+/// unless something moves it each one starts from the module's initial value —
+/// measured, five workers all reporting `0x24cf60`. They then write over each
+/// other's frames, and the damage surfaces as a pointer into a caller's frame
+/// coming back zero, thousands of instructions from the thread that wrote it.
+///
+/// An earlier attempt at this failed and the finding was recorded as "those
+/// offsets do not hold for this module". They do. What that attempt actually
+/// hit is the race the spin-wait above now closes: the creating thread fills
+/// `+52`/`+56` *after* the new thread is already running, so reading them at
+/// the top of the thread yields zeros, and installing zero bounds is what put
+/// the workers on wild addresses.
+///
+/// Reported rather than assumed at every step: a module without these exports,
+/// a control block that never filled in, and bounds that do not lie inside
+/// memory are each named in the log instead of silently skipped.
+fn establish_stack_space(
+    store: &mut Store<HostState>,
+    instance: &wasmtime::Instance,
+    shared: &SharedHost,
+    id: u64,
+    thread_ptr: u32,
+) {
+    // Both spellings of the restore entry point, for the reason `exports.rs`
+    // exists: emscripten ships it as `stackRestore` here and as
+    // `_emscripten_stack_restore` elsewhere, and a host that knows one name
+    // silently does nothing on a module carrying the other.
+    let restore = ["stackRestore", "_emscripten_stack_restore"]
+        .into_iter()
+        .find_map(|name| instance.get_func(&mut *store, name));
+
+    let (Some(set_limits), Some(restore)) = (
+        instance.get_func(&mut *store, "emscripten_stack_set_limits"),
+        restore,
+    ) else {
+        shared.log(
+            id,
+            format!(
+                "thread {id} keeps the initial stack: the module exports no \
+                 emscripten_stack_set_limits/stackRestore pair"
+            ),
+        );
+        return;
+    };
+
+    let (Some(high), Some(size)) = (
+        read_u32(store, thread_ptr.saturating_add(STACK_HIGH)),
+        read_u32(store, thread_ptr.saturating_add(STACK_SIZE)),
+    ) else {
+        shared.log(
+            id,
+            format!(
+                "thread {id} keeps the initial stack: pthread {thread_ptr:#x} is out of bounds"
+            ),
+        );
+        return;
+    };
+
+    // A half-filled control block, or one whose bounds are not inside memory,
+    // would install a stack pointer that traps on its first frame. Refuse it —
+    // "unsupported is an error, never a guess" applies to the host's own
+    // reads too.
+    let limit = store.data().memory.as_ref().map_or(0, |memory| {
+        u32::try_from(memory.data().len()).unwrap_or(u32::MAX)
+    });
+    if high == 0 || size == 0 || size > high || high > limit {
+        shared.log(
+            id,
+            format!(
+                "thread {id} keeps the initial stack: pthread {thread_ptr:#x} \
+                 reports stack {high:#x} size {size:#x}, not usable"
+            ),
+        );
+        return;
+    }
+
+    let low = high - size;
+    let installed = set_limits
+        .call(
+            &mut *store,
+            &[Val::I32(high as i32), Val::I32(low as i32)],
+            &mut [],
+        )
+        .and_then(|()| restore.call(&mut *store, &[Val::I32(high as i32)], &mut []));
+
+    match installed {
+        Ok(()) => shared.log(
+            id,
+            format!("thread {id} stack {low:#x}..{high:#x} ({size} bytes)"),
+        ),
+        Err(error) => shared.log(
+            id,
+            format!(
+                "thread {id} could not take its stack: {}",
+                first_line(&error)
+            ),
+        ),
+    }
+}
+
 /// Bundle passed into the new thread; keeps `run_thread`'s signature readable.
 struct Context_ {
     engine: Engine,
@@ -182,22 +323,8 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     {
         const SPINS: usize = 2000;
         for _ in 0..SPINS {
-            let ready = store
-                .data()
-                .memory
-                .as_ref()
-                .and_then(|memory| {
-                    let data = memory.data();
-                    let at = thread_ptr as usize + 52;
-                    let bytes = data.get(at..at + 4)?;
-                    // SAFETY: a read of bytes another thread is writing, which is
-                    // the point — shared memory is racy by design and this is
-                    // watching for the write to land.
-                    #[allow(unsafe_code)]
-                    let word: Vec<u8> = bytes.iter().map(|cell| unsafe { *cell.get() }).collect();
-                    Some(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-                })
-                .is_some_and(|top| top != 0);
+            let ready =
+                read_u32(&store, thread_ptr.saturating_add(STACK_HIGH)).is_some_and(|top| top != 0);
             if ready {
                 break;
             }
@@ -241,19 +368,19 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
             .context("__emscripten_thread_init")?;
     }
 
-    // Where this thread's stack actually is.
+    // Take this thread's own stack, as emscripten's worker does.
     //
-    // Threads are separate instances over one shared memory, and the stack
-    // pointer is a *per-instance* global — so unless something moves it, every
-    // thread starts from the module's initial value and they all write over the
-    // same region. That is invisible until a long-lived pointer into a caller's
-    // frame comes back wrong, which is exactly the shape of the bug being
-    // chased in VOIP_STATUS.md. Report it rather than assume `thread_init` did
-    // the right thing.
-    // Read through `stackSave`, not through an exported global. Global 0 *is*
-    // the stack pointer, but this module exports no globals — only a separately
-    // patched capture does — so asking for `__global_0` here logs nothing at
-    // all, which reads as "the stack is fine" rather than as "not measured".
+    // `__emscripten_thread_init` does not do it in this build — it sets the TLS
+    // globals and nothing else — and the stack pointer is a *per-instance*
+    // global, so without this every thread runs from the module's initial value
+    // and they all write over the same region.
+    establish_stack_space(&mut store, &instance, &ctx.shared, ctx.id, thread_ptr);
+
+    // What the thread ended up with, read through `stackSave` rather than
+    // through an exported global. Global 0 *is* the stack pointer, but this
+    // module exports no globals — only a separately patched capture does — so
+    // asking for `__global_0` here logs nothing at all, which reads as "the
+    // stack is fine" rather than as "not measured".
     if let Some(save) = instance.get_func(&mut store, "stackSave") {
         let mut sp = [Val::I32(0)];
         let reading = match save.call(&mut store, &[], &mut sp) {
@@ -277,13 +404,6 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
             .context("_emscripten_tls_init")?;
     }
 
-    // No `establishStackSpace` here, deliberately: `_emscripten_thread_init`
-    // already gives the thread its stack in this build. Doing it again from the
-    // host — reading the bounds from `struct pthread` at +52/+56, as
-    // emscripten's JS does — was measured and is much worse: those offsets do
-    // not hold for this module, the two words read pass a bounds check by
-    // accident, and installing them takes the worker pool from "1 returns, 2
-    // stop" to all five stopping on wild addresses and unaligned atomics.
     ctx.shared.scheduler.release(ctx.id);
 
     let entry = table_entry(&mut store, &instance, start_routine)?;

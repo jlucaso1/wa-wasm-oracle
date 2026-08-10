@@ -826,12 +826,54 @@ through another.
 **And `l3` is a stack address.** Probing it the same way — store `l3 + 1`, so
 that 0 still means "did not run" — reads back `0x24bed0`. The initial stack
 pointer is `0x24cf60` and `start_call_md`'s frame is 4176 bytes, so `l3` points
-inside that frame: the participant jid is a **local struct the bridge builds on
-its own stack**, and its first field — the user jid — is never filled.
+inside that frame.
 
 That is also the address this file has been calling "the participant array
 `make_and_cache_offer` reads", from much earlier and by a different route. The
-two agree.
+two agree — and **the array is what it is**, not a participant jid built on the
+stack. Reading `start_call_md`'s tail settles it, `oracle abi --index 1085
+--body 700`:
+
+    frame+268 .. +4124   memset 0, 3856 bytes    <- the call params blob
+    frame+268            strncpy(call_id, <= 63)
+    frame+264 = 1                                <- participant count
+    frame+0 .. +256      memset 0, 256 bytes     <- 64 participant slots
+    frame+0   = l8                               <- participants[0]
+    frame+260 = frame                            <- params->participants
+    f99(682, frame + 260)                        <- args = frame+260, not frame
+
+So `args + 0` is `params->participants`, `args + 4` is the count, and `l3` is
+the array — which is why it is a stack address and why `*(l3 + 0)` is
+`participants[0]`. `wa_call_start_internal`'s own entry guard agrees: it demands
+`1 <= arg4 <= 63`, so `arg3`/`arg4` are an array and a count, and `local 3` is
+never reassigned in its 2,842 instructions.
+
+**Which makes the null harder to explain, not easier.** Three static facts, each
+read out of the bytes rather than inferred:
+
+* `start_call_md` never builds the args struct when `create_participant_jid`
+  returns null. The two instructions after the call are `local.get 8; br_if 6`
+  and `br 8`, and `br 8` lands on the epilogue — it restores the stack and
+  returns an uninitialised `l11`, so a failed participant jid produces no
+  `make_and_cache_offer` and no `70008` at all.
+* `wa_call_participant_jid_create_with_params` (`f10293`, table slot 679)
+  **refuses** a null `params->user_jid`: the entry guard is
+  `params && pool && out && *(params + 0)`, and failing it asserts
+  `wa_call_participant_jid.cc:30` and returns `70004`. Its first act on success
+  is `*(obj + 0) = *(params + 0)` — which is precisely what
+  `get_user_jid` reads back.
+* `create_participant_jid` checks that return and asserts
+  `WaCallWebCallingBridge.cpp:101` if it is non-zero.
+
+A participant jid that exists therefore *has* a user jid, and a participant jid
+that does not exist never reaches the offer. Both cannot be true alongside
+`participants[0] == 0` at `offer.cc:485`, so one of the two is measuring
+something else — and the probe is the newer, less certain of the two. Note what
+it shares with everything else measured before this session: it was taken while
+every guest thread was running on the main thread's stack, `participants[0]`
+lives *on* that stack at `0x24bed0`, and a worker writing over it is exactly the
+shape of "stored non-null, read back zero". Re-taking it now that the workers
+have their own stacks is the first thing to do here.
 
 The probe only reports on runs that reach the site; the ones that stop earlier
 read 0 and say "did not run", which is exactly what the `+ 1` encoding is for.
@@ -1061,6 +1103,72 @@ too, and may need calling on the thread's instance.
 Exports worth knowing: `emscripten_stack_set_limits`, `..._get_base`,
 `..._get_end`, `..._get_current`, `..._get_free`, `emscripten_stack_init`,
 `stackSave`, `stackRestore`, `stackAlloc`, `pthread_self`.
+
+### The stack was the host's job after all, and the host now does it
+
+Those exports answer the question they were listed for. `emscripten_stack_get_
+base` and `..._get_end` report **`0x24cf60` and `0x14cf60`** — the main thread's
+stack is a 1 MiB region, and it is the region every guest thread was starting
+from. `threads.rs` now runs emscripten's `establishStackSpace` on each worker,
+reading `+52`/`+56` out of the thread's own `struct pthread` exactly as the web
+build does, and the workers land where the guest's `pthread_create` put them:
+
+```
+thread 1 stack 0x822350..0x832350 (65536 bytes)
+thread 2 stack 0x882350..0x892350 (65536 bytes)
+thread 3 stack 0x894690..0x8a4690 (65536 bytes)
+...
+```
+
+**Why the earlier attempt failed, and it was not the offsets.** This file
+recorded "those offsets do not hold for this module"; they hold. What that
+attempt hit is the race the spin-wait above it now closes — the creating thread
+fills `+52`/`+56` *after* the new thread is already running, so reading them at
+the top of the thread gives zeros, and zero bounds are what put the workers on
+wild addresses. Reading them after the wait gives a distinct 64 KiB region per
+thread, every run.
+
+Measured A/B on `examples/profiler_flag.rs`, which is the smallest run that
+starts a call — three runs each, deterministic both ways:
+
+| | shared stack | own stack |
+| --- | --- | --- |
+| `startVoipCall` | traps in `f763`, a destructor, under `f1139` | returns `70004` |
+| workers that stopped on an error | 1 | 0 |
+| main stack pointer afterwards | `0x241830` — 47 KiB never given back | `0x24cf60` |
+| profiler flag `0x14B958` | — | `0x00` throughout |
+
+The trap is the tell: `f763` is a `std::string` destructor running on the *main*
+thread, inside the embind bridge, on an object the main thread owns. Workers
+sharing its 1 MiB region is what reached in and corrupted it.
+
+### The profiler flag is 5,640 bytes below the main stack, and that is the whole story
+
+`scripts/neutralize_thread_profiler.py` says the corruption of `0x14B958` is
+"still unexplained". It is explained: **`emscripten_stack_get_end` is
+`0x14cf60`**, and `0x14B958` is `0x1608` bytes below it. Static data begins
+where the stack region ends, and the profiler flag is the first interesting byte
+under it — so a stack that runs past its own low bound writes exactly there.
+With seven threads sharing one 1 MiB region that is not a rare event, and it
+explains both symptoms the script names at once: the flag, and the
+out-of-linear-memory pointer in `pthread + 112`, which is the next thing down.
+
+With each worker on its own stack the flag reads `0x00` at instantiation, after
+the constructors, after `initVoipStack` and after `startVoipCall`, with the
+engine log ring attached and its level at 9, and with the soft-assert gate open
+— and no worker traps. **The instrument is no longer needed to keep the workers
+alive**, which is what it was for.
+
+`examples/outgoing_call.rs` is the exception and is worth stating plainly: it
+still ends with corrupted memory either way, and moving the stacks changes which
+kind — one `indirect call type mismatch` on the shared stack, eight `unaligned
+atomic` and one out-of-bounds on their own. It is a probe script written against
+a *patched* capture (it reports "sonda: nao rodou (captura sem patch?)" when run
+against the original) and it enables machinery a real client does not, so it is
+not a baseline. What it does establish is that something in what it does beyond
+the log level and the assert gate — both of which `profiler_flag.rs` now
+reproduces with no traps at all — corrupts memory on its own. `startJsWorkerThread`
+and `initSctpRingBuffer` are the two candidates left untested.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
