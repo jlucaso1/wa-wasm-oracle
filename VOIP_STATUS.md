@@ -1138,8 +1138,10 @@ starts a call — three runs each, deterministic both ways:
 | main stack pointer afterwards | `0x241830` — 47 KiB never given back | `0x24cf60` |
 | profiler flag `0x14B958` | — | `0x00` throughout |
 
-The trap is the tell: `f763` is a `std::string` destructor running on the *main*
-thread, inside the embind bridge, on an object the main thread owns. Workers
+The trap is the tell. `f763` is `f13513(object, 375)` — a container destructor
+releasing through table slot 375, which is `free` — and `f1139` is
+`startVoipCall`'s own embind wrapper. So it is the *main* thread freeing an
+object the main thread owns, inside the bridge, and finding it wrong. Workers
 sharing its 1 MiB region is what reached in and corrupted it.
 
 ### The profiler flag is 5,640 bytes below the main stack, and that is the whole story

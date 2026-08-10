@@ -26,8 +26,11 @@ jobs:
 
       - run: cargo fmt --all -- --check
 
+      # `--examples` too: without it a dead helper in one of them kept `flate2`
+      # in the dependency list, and the machete step below could not see it
+      # because the code referencing it still compiled.
       - name: clippy
-        run: cargo clippy --all --tests -- -D warnings
+        run: cargo clippy --all --tests --examples -- -D warnings
 
       # Pinned to a tag rather than @main: this is a third-party action running
       # in a job that holds a token for a private repository, and @main is
@@ -55,6 +58,10 @@ jobs:
       # captures, and a skipped run reports success while proving nothing —
       # which is exactly what this job did for as long as it looked for them in
       # a whatsapp-rust checkout that never carried them.
+      #
+      # The token is for the release fallback only. The lock's origin urls are
+      # tried first and need no credentials, so a fork whose token cannot read
+      # the private release still gets the whole set.
       - name: fetch captured modules
         env:
           GITHUB_TOKEN: ${{ github.token }}

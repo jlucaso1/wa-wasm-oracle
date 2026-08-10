@@ -262,8 +262,8 @@ Emscripten's worker does that with `establishStackSpace`, reading the bounds the
 guest's own `pthread_create` recorded in `struct pthread`, and `threads.rs` now
 does the same: seven threads sharing one 1 MiB region became one 64 KiB region
 each. The symptom it was producing is worth recognising — `startVoipCall`
-trapping inside a `std::string` destructor *on the main thread*, over an object
-the main thread owned, because a worker had written through it. See
+trapping inside a container destructor *on the main thread*, over an object the
+main thread owned, because a worker had written through it. See
 "The stack was the host's job after all" in `VOIP_STATUS.md`.
 
 ## Determinism

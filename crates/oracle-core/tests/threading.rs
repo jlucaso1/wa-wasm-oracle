@@ -559,7 +559,7 @@ fn startup_is_reliable_and_never_forces_a_turn() {
 /// separate instance, so without `establishStackSpace` each one starts from the
 /// module's initial value and they all write over the same 1 MiB region. That
 /// is not a theoretical hazard: it corrupted an object the *main* thread owned,
-/// and `startVoipCall` trapped inside a `std::string` destructor as a result.
+/// and `startVoipCall` trapped inside a container destructor as a result.
 ///
 /// Asserted through the host log rather than through `stackSave`, because the
 /// interesting property is about several threads at once and each reads its own
