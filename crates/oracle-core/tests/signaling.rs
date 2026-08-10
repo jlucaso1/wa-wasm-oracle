@@ -229,7 +229,11 @@ fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
 /// that answers — with any status, including a refusal — is returned as it is,
 /// and the test judges it.
 fn deliver_without_a_lock_inversion(runtime: &mut Runtime, stanza: &str) -> Vec<String> {
-    const ATTEMPTS: usize = 8;
+    // Four, not more. Each attempt builds a fresh engine and `engine()` retries
+    // startup six times inside that, so the two multiply; measured, four
+    // rounds of `a_well_formed_offer_is_accepted` passed in 37-53 s each,
+    // which is two or three attempts.
+    const ATTEMPTS: usize = 4;
 
     for attempt in 1..=ATTEMPTS {
         let lines = deliver(runtime, stanza.to_owned());
@@ -896,10 +900,12 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
     };
 
     let payload = serialize(&offer_for(&runtime), true);
-    // Through the lock-watchdog retry: an offer that ended in an inversion left
-    // the engine mid-reaction, and what the call after it does then says
-    // nothing about whether the settings carried over.
-    let _ = deliver_without_a_lock_inversion(&mut runtime, &payload);
+    // Plain `deliver`, not the lock-watchdog retry. What this asserts is that
+    // the *sequence* does not shred the engine's log, which an inversion does
+    // not affect — and routing it through the retry cost twenty minutes on its
+    // own, because a fresh engine per attempt compounds with the six startup
+    // retries inside `engine()`.
+    let _ = deliver(&mut runtime, payload);
 
     let mark = runtime.engine_log().len();
     let _ = runtime.call_embind(
