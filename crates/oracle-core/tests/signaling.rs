@@ -925,19 +925,32 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
 
     let lines = runtime.engine_log_from(mark);
 
-    // What this actually found: the sequence leaves the engine's log full of
-    // random bytes rather than messages. Every line is short, printable noise
-    // with none of the `file.cc`/`EVENT:` shape real entries have — the same
-    // "hundreds of garbage lines" seen before, which means state is corrupt
-    // rather than that the call went quiet.
+    // What this actually found: about one run in four, the sequence leaves the
+    // engine's log full of random bytes rather than messages — 880 lines of
+    // them, none with the `file.cc`/`EVENT:` shape a real entry has:
+    //
+    //     "E'8da(R#"  "8+bb=BX+"  "{wP>Lc$C"  "6?U,f|n>"
+    //
+    // Two things narrow that. The ring has **not** overflowed, so this is not
+    // the reader running off the end of what it may read. And the ring is a
+    // plain `malloc` in the guest heap that `attach_log_ring` hands to
+    // `initLogRingBuffer`, so something wrote high-entropy data — key material
+    // is the obvious candidate during call setup — straight over a live
+    // allocation. That is the same heap corruption `free` refuses a pointer
+    // over inside `startVoipCall`, caught somewhere it can be read instead of
+    // somewhere it traps.
     let structured = lines
         .iter()
         .filter(|line| line.contains(".c") || line.contains("EVENT") || line.contains("call"))
         .count();
     eprintln!(
-        "after an incoming offer, an outgoing call yields {} lines, {structured} of them structured",
-        lines.len()
+        "after an incoming offer, an outgoing call yields {} lines, {structured} of them structured; overflowed={}",
+        lines.len(),
+        runtime.engine_log_overflowed()
     );
+    for line in lines.iter().take(6) {
+        eprintln!("  SAMPLE {line:?}");
+    }
 
     // So the useful invariant is about corruption, not about the guard: doing
     // both in one engine must not shred the log. If this ever passes cleanly,

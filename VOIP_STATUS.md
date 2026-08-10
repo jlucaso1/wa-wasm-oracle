@@ -1163,6 +1163,34 @@ wasm has no guard page, and the engine's own frames are not small —
 `start_call_md` alone takes 4,176 bytes plus a 3,856-byte `memory.fill`. It is
 the first thing to account for before re-trying this.
 
+### Something writes key-shaped bytes over a live allocation
+
+The `free`-refusing-a-pointer trap has a second symptom, and this one can be
+read rather than only crashed into. About one run in four,
+`settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` comes back
+with the engine's log ring holding 880 lines of this:
+
+```
+"E'8da(R#"  "8+bb=BX+"  "{wP>Lc$C"  "6?U,f|n>"  "dpDe?-o/"  "hHe&kd7U"
+```
+
+High entropy, no structure, and — this is the part that matters —
+`engine_log_overflowed()` is **false**, so it is not the reader running past
+what it may read. The ring is a plain `malloc` in the guest heap that
+`attach_log_ring` hands to `initLogRingBuffer`; WhatsApp Web does the same. So
+something wrote over a live allocation, and during call setup the obvious
+candidate for bytes that look like that is key material.
+
+The other three runs in four come back with 31-34 structured lines and the ring
+intact, from the same code and the same input.
+
+That makes this the cheapest handle on the corruption behind the trap: it lands
+somewhere with a known base address and a known length, both held by the host,
+instead of somewhere that only shows up when `free` refuses the result. What it
+needs next is the allocation's neighbours — what `startVoipCall` allocates
+immediately before and after the ring, and whether the overwrite starts at the
+ring's base or partway in.
+
 ### The profiler flag is 5,640 bytes below the main stack
 
 `scripts/neutralize_thread_profiler.py` says the corruption of `0x14B958` is

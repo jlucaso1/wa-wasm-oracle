@@ -169,12 +169,24 @@ so it works on captures that do not exist yet. The order that has paid off:
    null, and three static facts say it cannot be — see "What `l1` is" in
    `VOIP_STATUS.md`. One of the two is measuring something else, and the probe
    is the newer and less certain of them.
-2. **What hands `free` a bad pointer.** `f1139` → `f763` → `f13513` → `f13089`,
-   a container destructor inside `startVoipCall`'s embind wrapper. It is the
-   trap that shows up whichever stack the workers use — see "Giving each thread
-   its own stack works, and is still not the fix" — so it is heap corruption
-   that predates every explanation offered for it so far, and it is upstream of
-   most of the rest of this list.
+2. **What writes over the guest heap.** Two symptoms, one bug, and it is
+   upstream of most of the rest of this list.
+
+   `f1139` → `f763` → `f13513` → `f13089` is a container destructor inside
+   `startVoipCall`'s embind wrapper handing `free` a pointer it refuses. It
+   shows up whichever stack the workers use — see "Giving each thread its own
+   stack works, and is still not the fix" — so it predates every explanation
+   offered for it so far.
+
+   The other symptom is readable rather than fatal, which makes it the better
+   place to start. About one run in four,
+   `settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` finds the
+   engine's log ring full of high-entropy bytes — `"E'8da(R#"`, `"8+bb=BX+"` —
+   with the ring *not* overflowed. That ring is a plain `malloc` handed to
+   `initLogRingBuffer`, so something wrote what looks like key material over a
+   live allocation, and the host can read the wreckage instead of trapping on
+   it. The test is a guard, not a defect: it is red when the corruption
+   happens, which is the only reason this is known at all.
 3. **Drive a full call flow**: `initVoipStack` then
    `handleIncomingSignalingOffer`, and compare the recorded
    `sendSignalingXMPP_js_sync` payloads against what whatsapp-rust emits. The
