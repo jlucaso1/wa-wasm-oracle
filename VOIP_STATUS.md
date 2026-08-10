@@ -1164,13 +1164,19 @@ alive**, which is what it was for.
 `examples/outgoing_call.rs` is the exception and is worth stating plainly: it
 still ends with corrupted memory either way, and moving the stacks changes which
 kind — one `indirect call type mismatch` on the shared stack, eight `unaligned
-atomic` and one out-of-bounds on their own. It is a probe script written against
-a *patched* capture (it reports "sonda: nao rodou (captura sem patch?)" when run
-against the original) and it enables machinery a real client does not, so it is
-not a baseline. What it does establish is that something in what it does beyond
-the log level and the assert gate — both of which `profiler_flag.rs` now
-reproduces with no traps at all — corrupts memory on its own. `startJsWorkerThread`
-and `initSctpRingBuffer` are the two candidates left untested.
+atomic` and one out-of-bounds on their own.
+
+**That pair is not a comparison, by this file's own health rule.** Both sides
+came back at ~54 engine-log lines against the ~200 a healthy run reaches, so
+both are short runs, and the table further down says exactly what a short run is
+worth. It is also a probe script written against a *patched* capture — it
+reports "probe: did not run (unpatched capture?)" against the original — and it
+enables machinery a real client does not.
+
+What it does establish is that something in what it does corrupts memory on its
+own, because `profiler_flag.rs` reproduces its log level *and* its assert gate
+with no traps at all and the flag never moving. `startJsWorkerThread` and
+`initSctpRingBuffer` are what is left between them.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
