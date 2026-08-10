@@ -33,9 +33,9 @@ use oracle_core::{Catalog, Runtime, ThreadPolicy, Value};
 /// passed as `"{}"` — a settings blob it never was — which is what
 /// `get_app_jids: wa_call_device_jid_from_string failed` and `Failed to fetch
 /// typed self lid device jid` were reporting.
-/// Onde as sondas de bytecode gravam. Fica acima do que a engine usa porque o
-/// host cresce a memoria ate la — o que so funciona desde que `grow_memory`
-/// aprendeu a crescer a memoria *importada*. Verificado por leitura de volta.
+/// Where the bytecode probes write. Above anything the engine uses, because
+/// the host grows memory out to it — which only works since `grow_memory`
+/// learned to grow an *imported* memory. Confirmed by reading it back.
 const SCRATCH: u32 = 0x2FF_0000;
 
 const SELF: &str = "15550002222@c.us";
@@ -199,7 +199,7 @@ fn engine_once(bytes: &[u8]) -> anyhow::Result<Runtime> {
     // fine — "Application settings not loaded" stops appearing — and takes the
     // run from 167 log lines to 93. A real client gets these from the server.
     let _ = AB_INT;
-    println!("AB props (bool) aceitas: {ab_set}/{}", AB_BOOL.len());
+    println!("AB props (bool) accepted: {ab_set}/{}", AB_BOOL.len());
 
     let init_mark = runtime.engine_log().len();
     let init = runtime.call_embind(
@@ -273,20 +273,19 @@ fn main() -> anyhow::Result<()> {
     // reports it — so adding our own LID to the list is not the missing piece.
     // See VOIP_STATUS.md.
     // The fifth argument is a *legacy-form* JID in WhatsApp Web, not a LID:
-    // `StartCall.js` passes `(g ?? h).toString({legacy: true})`. We have been
-    // passing the LID there, which is worth testing directly — 70008 is the
-    // code the engine already uses for a JID in the form it did not want.
-    const PEER_LEGACY: &str = "11223344556677@c.us";
-
+    // `StartCall.js` passes `(g ?? h).toString({legacy: true})`. Passing
+    // `11223344556677@c.us` there was tried and changes nothing — see the
+    // excluded-variants table in VOIP_STATUS.md — so both shapes below use the
+    // LID and vary only what the participant list holds.
     let shapes: [(&str, &str, &str, Vec<String>); 2] = [
         (
-            "device na lista",
+            "device in the list",
             PEER_LID,
             PEER_LID,
             vec![PEER_LID_DEVICE.to_owned()],
         ),
         (
-            "bare na lista",
+            "bare in the list",
             PEER_LID,
             PEER_LID,
             vec![PEER_LID.to_owned()],
@@ -431,13 +430,13 @@ fn main() -> anyhow::Result<()> {
             runtime.refuel();
             runtime.settle(std::time::Duration::from_secs(5));
 
-            // As sondas gravam `valor + 1`, entao 0 significa "nao rodou" e 1
-            // significa "rodou e o valor era zero" — duas coisas que uma sonda
-            // ingenua confunde.
+            // The probes store `value + 1`, so 0 means "did not run" and 1
+            // means "ran, and the value was zero" — two things a naive probe
+            // reports identically.
             match runtime.read_u32_at(SCRATCH) {
-                Ok(0) => println!("   sonda: nao rodou (captura sem patch?)"),
-                Ok(raw) => println!("   sonda: {:#x}", raw - 1),
-                Err(error) => println!("   sonda ilegivel: {error:#}"),
+                Ok(0) => println!("   probe: did not run (unpatched capture?)"),
+                Ok(raw) => println!("   probe: {:#x}", raw - 1),
+                Err(error) => println!("   probe unreadable: {error:#}"),
             }
             println!("   live threads after: {}", runtime.live_threads());
             for note in runtime.logs().iter().filter(|line| line.contains("thread")) {
@@ -479,21 +478,23 @@ fn main() -> anyhow::Result<()> {
             let lines = runtime.engine_log_from(mark);
             let sent = runtime.all_calls_to("env::sendSignalingXMPP_js_sync").len();
             let events = runtime.all_calls_to("env::on_call_event_js_sync").len();
+            let verdict = match &outcome {
+                Ok(value) => format!("{value:?}"),
+                Err(error) => {
+                    let report = format!("{error:#}");
+                    let frame = report
+                        .lines()
+                        .find(|line| line.contains("wasm function"))
+                        .unwrap_or("?")
+                        .trim();
+                    format!("trap: {frame}")
+                }
+            };
             println!(
-                "=== {label:22} hold={hold} -> {} | {} lines{}, {sent} sent, {events} events",
-                match &outcome {
-                    Ok(value) => format!("{value:?}"),
-                    Err(error) => format!(
-                        "trap: {}",
-                        format!("{error:#}")
-                            .lines()
-                            .find(|line| line.contains("wasm function"))
-                            .unwrap_or("?")
-                            .trim()
-                    ),
-                },
+                "=== {label:22} hold={hold} -> {verdict} | {} lines \
+                 (overflowed={overflowed}, engine dropped {dropped}), \
+                 {sent} sent, {events} events",
                 lines.len(),
-                format!(" (overflowed={overflowed}, engine dropped {dropped})")
             );
             for line in lines.iter().take(140) {
                 println!("      {}", line.trim());

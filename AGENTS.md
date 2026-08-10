@@ -7,10 +7,14 @@ first — it holds the module map, the recovered VoIP API, and the known limits.
 
 ```sh
 cargo fmt --all
-cargo clippy --all --tests --release -- -D warnings
+cargo clippy --all --tests --examples --release -- -D warnings
 cargo test --release
 cargo machete                 # no unused dependencies
 ```
+
+`--examples` is in that line deliberately. They were outside it, and what
+accumulated behind the gap was a dead helper carrying `flate2` — a whole
+dependency kept alive by a function nothing called.
 
 Always `--release` for anything that executes a module. In a debug build
 Cranelift compiles the 9.3 MiB VoIP module so slowly that runs look hung.

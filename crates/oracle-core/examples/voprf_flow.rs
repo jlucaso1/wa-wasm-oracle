@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
     let scalar = call(&mut r, "get_curve_scalar_bytes", &[curve]).unwrap_or(32);
     println!("ristretto255: element={element}B scalar={scalar}B");
 
-    let mut blind = |r: &mut Runtime, input: &[u8]| -> Option<(Vec<u8>, Vec<u8>)> {
+    let blind = |r: &mut Runtime, input: &[u8]| -> Option<(Vec<u8>, Vec<u8>)> {
         let inp = r.write_bytes(input).ok()? as i32;
         let point = r.malloc(element as u32).ok()? as i32;
         let sc = r.malloc(scalar as u32).ok()? as i32;
