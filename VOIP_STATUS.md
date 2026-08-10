@@ -868,12 +868,16 @@ read out of the bytes rather than inferred:
 A participant jid that exists therefore *has* a user jid, and a participant jid
 that does not exist never reaches the offer. Both cannot be true alongside
 `participants[0] == 0` at `offer.cc:485`, so one of the two is measuring
-something else — and the probe is the newer, less certain of the two. Note what
-it shares with everything else measured before this session: it was taken while
-every guest thread was running on the main thread's stack, `participants[0]`
-lives *on* that stack at `0x24bed0`, and a worker writing over it is exactly the
-shape of "stored non-null, read back zero". Re-taking it now that the workers
-have their own stacks is the first thing to do here.
+something else — and the probe is the newer, less certain of the two.
+
+The obvious suspect is that `participants[0]` is written correctly and then
+overwritten: it lives at `0x24bed0`, on the main thread's stack, which every
+guest thread also runs on. That is exactly the shape of "stored non-null, read
+back zero" — but it does not survive the next section. Giving the workers their
+own stacks does not make the offer path behave differently; it makes
+`startVoipCall` trap earlier, on a heap pointer, deterministically. Whatever
+zeroes this word has to be something that still happens when the workers are
+nowhere near that region.
 
 The probe only reports on runs that reach the site; the ones that stop earlier
 read 0 and say "did not run", which is exactly what the `+ 1` encoding is for.
