@@ -1104,79 +1104,82 @@ Exports worth knowing: `emscripten_stack_set_limits`, `..._get_base`,
 `..._get_end`, `..._get_current`, `..._get_free`, `emscripten_stack_init`,
 `stackSave`, `stackRestore`, `stackAlloc`, `pthread_self`.
 
-### The stack was the host's job after all, and the host now does it
+### Giving each thread its own stack works, and is still not the fix
 
 Those exports answer the question they were listed for. `emscripten_stack_get_
 base` and `..._get_end` report **`0x24cf60` and `0x14cf60`** — the main thread's
-stack is a 1 MiB region, and it is the region every guest thread was starting
-from. `threads.rs` now runs emscripten's `establishStackSpace` on each worker,
-reading `+52`/`+56` out of the thread's own `struct pthread` exactly as the web
-build does, and the workers land where the guest's `pthread_create` put them:
+stack is a 1 MiB region, and it is the region every guest thread starts from.
+
+Running emscripten's `establishStackSpace` on each worker — reading `+52`/`+56`
+out of the thread's own `struct pthread`, exactly as the web build does — works.
+The workers land where the guest's `pthread_create` put them:
 
 ```
 thread 1 stack 0x822350..0x832350 (65536 bytes)
 thread 2 stack 0x882350..0x892350 (65536 bytes)
 thread 3 stack 0x894690..0x8a4690 (65536 bytes)
-...
 ```
 
-**Why the earlier attempt failed, and it was not the offsets.** This file
-recorded "those offsets do not hold for this module"; they hold. What that
-attempt hit is the race the spin-wait above it now closes — the creating thread
-fills `+52`/`+56` *after* the new thread is already running, so reading them at
-the top of the thread gives zeros, and zero bounds are what put the workers on
-wild addresses. Reading them after the wait gives a distinct 64 KiB region per
-thread, every run.
+**The offsets hold.** This file recorded "those offsets do not hold for this
+module"; they do. What the earlier attempt hit is the race the spin-wait in
+`threads.rs` now closes — the creating thread fills `+52`/`+56` *after* the new
+thread is already running, so reading them at the top of the thread gives zeros,
+and zero bounds are what put the workers on wild addresses.
 
-Measured A/B on `examples/profiler_flag.rs`, which is the smallest run that
-starts a call — three runs each, deterministic both ways:
+**And it is still not an improvement, measured both ways.** It is not in
+`threads.rs`, and the reason is this pair of results rather than a preference:
 
 | | shared stack | own stack |
 | --- | --- | --- |
-| `startVoipCall` | traps in `f763`, a destructor, under `f1139` | returns `70004` |
-| workers that stopped on an error | 1 | 0 |
-| main stack pointer afterwards | `0x241830` — 47 KiB never given back | `0x24cf60` |
-| profiler flag `0x14B958` | — | `0x00` throughout |
+| `profiler_flag.rs` — `startVoipCall` | traps in `f763` | returns `70004` |
+| `profiler_flag.rs` — workers stopped | 1 | 0 |
+| `profiler_flag.rs` — main SP afterwards | `0x241830` | `0x24cf60` |
+| `signaling --ignored` | **23 passed** | **21 passed, 2 failed** |
 
-The trap is the tell. `f763` is `f13513(object, 375)` — a container destructor
-releasing through table slot 375, which is `free` — and `f1139` is
-`startVoipCall`'s own embind wrapper. So it is the *main* thread freeing an
-object the main thread owns, inside the bridge, and finding it wrong. Workers
-sharing its 1 MiB region is what reached in and corrupted it.
+The minimal probe says the change fixes something; the full suite says it breaks
+two things. The tie-break is *what* breaks, and it is the same trap in both
+columns: `f1139` (`startVoipCall`'s embind wrapper) → `f763` → `f13513` →
+`f13089`, a container destructor handing `free` a pointer it refuses. Four
+attempts out of four in `the_engine_starts_an_outgoing_call`, and the other
+failure is offer-then-call filling the log ring with 880 unstructured lines.
 
-### The profiler flag is 5,640 bytes below the main stack, and that is the whole story
+**So the heap corruption behind that trap is not the shared stack.** Moving the
+stacks moves which run trips it, and nothing more. Anything built on "the
+workers were writing over each other" has to survive that.
+
+What the change does buy, and what a next attempt should keep: the workers get
+64 KiB each where they had been borrowing 1 MiB. That is a 16× cut in headroom,
+wasm has no guard page, and the engine's own frames are not small —
+`start_call_md` alone takes 4,176 bytes plus a 3,856-byte `memory.fill`. It is
+the first thing to account for before re-trying this.
+
+### The profiler flag is 5,640 bytes below the main stack
 
 `scripts/neutralize_thread_profiler.py` says the corruption of `0x14B958` is
-"still unexplained". It is explained: **`emscripten_stack_get_end` is
-`0x14cf60`**, and `0x14B958` is `0x1608` bytes below it. Static data begins
-where the stack region ends, and the profiler flag is the first interesting byte
-under it — so a stack that runs past its own low bound writes exactly there.
-With seven threads sharing one 1 MiB region that is not a rare event, and it
-explains both symptoms the script names at once: the flag, and the
-out-of-linear-memory pointer in `pthread + 112`, which is the next thing down.
+"still unexplained". Here is the geometry it was missing: **`emscripten_stack_
+get_end` is `0x14cf60`**, and `0x14B958` is `0x1608` bytes below it. Static data
+begins where the stack region ends, and the profiler flag is the first
+interesting byte under it — so a stack running past its own low bound writes
+exactly there, and seven threads sharing one 1 MiB region is not a rare way to
+do that.
 
-With each worker on its own stack the flag reads `0x00` at instantiation, after
-the constructors, after `initVoipStack` and after `startVoipCall`, with the
-engine log ring attached and its level at 9, and with the soft-assert gate open
-— and no worker traps. **The instrument is no longer needed to keep the workers
-alive**, which is what it was for.
+That is geometry, not proof, and `examples/profiler_flag.rs` is what would
+carry it further: it reads the byte at instantiation, after the constructors,
+after `initVoipStack` and after `startVoipCall`, with the engine log ring
+attached at level 9 and the soft-assert gate open. **On the current host it
+reads `0x00` at every one of those points, with no worker trapping.** So the
+run that needs the patched capture is not this one, and the script's own
+"27 lines and eleven traps" baseline is not reproducible here.
 
-`examples/outgoing_call.rs` is the exception and is worth stating plainly: it
-still ends with corrupted memory either way, and moving the stacks changes which
-kind — one `indirect call type mismatch` on the shared stack, eight `unaligned
-atomic` and one out-of-bounds on their own.
-
-**That pair is not a comparison, by this file's own health rule.** Both sides
-came back at ~54 engine-log lines against the ~200 a healthy run reaches, so
-both are short runs, and the table further down says exactly what a short run is
-worth. It is also a probe script written against a *patched* capture — it
+`examples/outgoing_call.rs` still ends with corrupted memory, and this is where
+that lives now. It is a probe script written against a *patched* capture — it
 reports "probe: did not run (unpatched capture?)" against the original — and it
-enables machinery a real client does not.
-
-What it does establish is that something in what it does corrupts memory on its
-own, because `profiler_flag.rs` reproduces its log level *and* its assert gate
-with no traps at all and the flag never moving. `startJsWorkerThread` and
-`initSctpRingBuffer` are what is left between them.
+enables machinery a real client does not. Both of its recent runs came back at
+~54 engine-log lines against the ~200 a healthy run reaches, so by the health
+rule further down neither is evidence about anything. What it does establish is
+that something it does corrupts memory on its own, because `profiler_flag.rs`
+reproduces its log level *and* its assert gate with none of that.
+`startJsWorkerThread` and `initSctpRingBuffer` are what is left between them.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at

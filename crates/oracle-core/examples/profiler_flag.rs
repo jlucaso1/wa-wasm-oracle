@@ -1,4 +1,4 @@
-//! What corrupted the thread-status profiler flag, and the answer.
+//! Where the thread-status profiler flag sits, and whether it has moved.
 //!
 //! `f12302` — emscripten's `emscripten_conditional_set_current_thread_status`,
 //! which every engine worker reaches from the futex wait path — returns
@@ -8,22 +8,28 @@
 //! not: `scripts/neutralize_thread_profiler.py` exists because forcing the test
 //! to fail took a run from eleven traps to none.
 //!
-//! **It was the stack.** This example prints the two numbers that say so:
+//! **Where it sits.** This example prints the two numbers that frame it:
 //!
 //! ```text
 //! main stack: base 0x24cf60 end 0x14cf60 ...
 //! ```
 //!
 //! `0x14B958` is `0x1608` bytes below `end`. Static data begins where the stack
-//! region stops, and the flag is the first interesting byte under it — so a
-//! stack running past its own low bound writes exactly there. Every guest
-//! thread used to start from `0x24cf60`, so seven threads shared that 1 MiB
-//! region. Now that each takes the stack its own `struct pthread` records, the
-//! flag reads `0x00` at every point below and no worker traps, with the engine
-//! log at level 9 and the soft-assert gate open.
+//! region stops and the flag is the first interesting byte under it, so a stack
+//! running past its own low bound writes exactly there — and every guest thread
+//! starts from `0x24cf60`, so they share that 1 MiB region.
 //!
-//! So this is a guard as much as a probe: a non-zero flag here means the
-//! corruption is back, and the trap count says whether it mattered.
+//! That is geometry, not proof, and this run does not reproduce the problem:
+//! the flag reads `0x00` at instantiation, after the constructors, after
+//! `initVoipStack` and after `startVoipCall`, with the engine log ring attached
+//! at level 9 and the soft-assert gate open, and no worker traps. So it is a
+//! guard as much as a probe — a non-zero flag here means the corruption is
+//! back, and the trap count says whether it mattered.
+//!
+//! It is also the smallest run that starts a call, which makes it the A/B
+//! harness for anything touching `threads.rs`. See "Giving each thread its own
+//! stack works, and is still not the fix" in VOIP_STATUS.md for the numbers it
+//! produced there.
 //!
 //! ```sh
 //! cargo run --release --example profiler_flag [--verbose-engine] [--enable-asserts]

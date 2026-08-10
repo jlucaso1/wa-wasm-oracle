@@ -255,16 +255,16 @@ believed no thread was the main one. Nothing failed immediately — but the firs
 time a worker tried to coordinate with the main thread, the main thread spun
 forever waiting for one that never identified itself.
 
-**A thread also has to be given its stack.** The stack pointer is a per-instance
-global, so a new instance starts from the module's initial value — which means
-every guest thread ran on the *main thread's* stack until something moved it.
-Emscripten's worker does that with `establishStackSpace`, reading the bounds the
-guest's own `pthread_create` recorded in `struct pthread`, and `threads.rs` now
-does the same: seven threads sharing one 1 MiB region became one 64 KiB region
-each. The symptom it was producing is worth recognising — `startVoipCall`
-trapping inside a container destructor *on the main thread*, over an object the
-main thread owned, because a worker had written through it. See
-"The stack was the host's job after all" in `VOIP_STATUS.md`.
+**Every guest thread runs on the main thread's stack**, and that is a known gap
+rather than an oversight. The stack pointer is a per-instance global, so a new
+instance starts from the module's initial `0x24cf60`; emscripten's worker moves
+it with `establishStackSpace`, reading bounds out of `struct pthread`. Doing the
+same here works — each worker takes its own 64 KiB region — and it costs two
+signaling tests, because the heap corruption it was meant to explain trips in a
+different run instead of stopping. Measured both ways in "Giving each thread its
+own stack works, and is still not the fix" in `VOIP_STATUS.md`; read it before
+re-trying, and note that 64 KiB against the borrowed 1 MiB is a 16× cut in
+headroom with no guard page behind it.
 
 ## Determinism
 

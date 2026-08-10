@@ -158,20 +158,28 @@ so it works on captures that do not exist yet. The order that has paid off:
 
 ## Open work
 
-1. **Re-take the `participants[0]` measurement.** `offer.cc:485` reads it as
+1. **Reconcile `participants[0]` with the bytecode.** `offer.cc:485` reads it as
    null, and three static facts say it cannot be — see "What `l1` is" in
-   `VOIP_STATUS.md`. The array lives on the main thread's stack, and every
-   earlier measurement was taken while every *worker* was also running on that
-   stack. That is fixed; the probe has not been re-run since.
-2. **Drive a full call flow**: `initVoipStack` then
+   `VOIP_STATUS.md`. One of the two is measuring something else, and the probe
+   is the newer and less certain of them.
+2. **What hands `free` a bad pointer.** `f1139` → `f763` → `f13513` → `f13089`,
+   a container destructor inside `startVoipCall`'s embind wrapper. It is the
+   trap that shows up whichever stack the workers use — see "Giving each thread
+   its own stack works, and is still not the fix" — so it is heap corruption
+   that predates every explanation offered for it so far, and it is upstream of
+   most of the rest of this list.
+3. **Drive a full call flow**: `initVoipStack` then
    `handleIncomingSignalingOffer`, and compare the recorded
    `sendSignalingXMPP_js_sync` payloads against what whatsapp-rust emits. The
-   marshalling this needs is done; what is missing is a realistic offer payload.
-3. **What corrupts memory in `examples/outgoing_call.rs`.** It ends with traps
+   marshalling this needs is done. What is in the way is not the payload but the
+   main-thread proxy queue — see `state.rs`: the engine queues its outbound
+   stanzas there and every drain fails while `register_main_thread` is off.
+   `init_stress --register-main-thread` measures what turning it on costs.
+4. **What corrupts memory in `examples/outgoing_call.rs`.** It ends with traps
    whichever stack the workers use, while `examples/profiler_flag.rs` — same
    engine, same log level, same assert gate — has none. `startJsWorkerThread`
    and `initSctpRingBuffer` are what remain untested between them.
-4. **Non-vector embind classes**, if a module ever registers one that matters.
+5. **Non-vector embind classes**, if a module ever registers one that matters.
 
 `_start` exiting 71 on the media modules used to head this list. It was already
 fixed by the WASI memory-window bug in the table above and nothing noticed,
