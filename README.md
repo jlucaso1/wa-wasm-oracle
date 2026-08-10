@@ -128,10 +128,25 @@ touches the real filesystem.
 | `php8T1oSIZM` | 373 KiB | **mozjpeg** — `imgoperations/wajs-mozjpeg-wasm` | instantiates clean |
 | `rogm88TRRiw` | 2.0 MiB | **WebP / media** — `webpcheck.rs`, `libwamediacommon-rs` | **runs as a CLI** |
 | `ayqr5HQtlkb` | 2.0 MiB | **MP4 utils** — check, repair, remux | **runs as a CLI** |
-| `9Nbh3eMuVjD` | 2.8 MiB | **MP4 core** — `libmp4operations-rs`, stream-type tables | loads |
+| `9Nbh3eMuVjD` | 2.8 MiB | **MP4 core** — `libmp4operations-rs`, stream-type tables | **runs as a CLI** |
 
 `rogm88TRRiw` and `ayqr5HQtlkb` kept their name section and export readable
 symbols (`ExamineH264Stream`, `ParseAACStream`, `convertFixed32BitToFloat`).
+
+`9Nbh3eMuVjD` is the odd one: a *Rust* implementation with a `clap` command
+line, next to the C++ tool suite that does the same job.
+
+```console
+$ oracle run 9Nbh3eMuVjD -f in.mp4=clip.mp4 -- mediautils mp4check in.mp4
+MP4 file consistency: OK
+
+$ oracle run 9Nbh3eMuVjD -f in.mp4=junk.bin -- mediautils mp4check in.mp4
+Error: WamediaError(239: Unknown MP4 box topology)
+exit: 1
+
+$ oracle run 9Nbh3eMuVjD -f x=clip.mp4 -- classify x       # by content, not by name
+Mimetype: Some("video/mp4"), Extension: Some("mp4"), Score: 0, Reason: 0
+```
 
 ## The VoIP engine
 

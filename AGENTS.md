@@ -154,12 +154,22 @@ so it works on captures that do not exist yet. The order that has paid off:
 
 ## Open work
 
-1. **`_start` on the media modules exits 71** before reading `argv`. Their
-   exported functions are callable directly, so this blocks nothing, but the
-   cause is unconfirmed — likely the file-handling callbacks
-   (`setFileHandlingCallback`).
+1. **Re-take the `participants[0]` measurement.** `offer.cc:485` reads it as
+   null, and three static facts say it cannot be — see "What `l1` is" in
+   `VOIP_STATUS.md`. The array lives on the main thread's stack, and every
+   earlier measurement was taken while every *worker* was also running on that
+   stack. That is fixed; the probe has not been re-run since.
 2. **Drive a full call flow**: `initVoipStack` then
    `handleIncomingSignalingOffer`, and compare the recorded
    `sendSignalingXMPP_js_sync` payloads against what whatsapp-rust emits. The
    marshalling this needs is done; what is missing is a realistic offer payload.
-3. **Non-vector embind classes**, if a module ever registers one that matters.
+3. **What corrupts memory in `examples/outgoing_call.rs`.** It ends with traps
+   whichever stack the workers use, while `examples/profiler_flag.rs` — same
+   engine, same log level, same assert gate — has none. `startJsWorkerThread`
+   and `initSctpRingBuffer` are what remain untested between them.
+4. **Non-vector embind classes**, if a module ever registers one that matters.
+
+`_start` exiting 71 on the media modules used to head this list. It was already
+fixed by the WASI memory-window bug in the table above and nothing noticed,
+because the MP4 core was the one module in the lock that no test exercised.
+`the_mp4_core_reads_its_arguments` now does.

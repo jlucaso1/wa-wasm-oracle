@@ -356,3 +356,71 @@ fn mp4mux_combines_audio_and_video() {
         "adding audio did not grow the file ({with_audio} vs {video_only})"
     );
 }
+
+/// The MP4 core, which is a different program from the MP4 utils above.
+///
+/// `ayqr5HQtlkb` is the C++ tool suite; `9Nbh3eMuVjD` is
+/// `libmp4operations-rs`, WhatsApp's Rust MP4 implementation, and it ships its
+/// own `clap` command line. It was the one module in the lock that nothing
+/// exercised, which is also why "`_start` exits 71 before reading argv" stayed
+/// on the open-work list after the WASI window bug that caused it was fixed:
+/// no test would have noticed either way.
+#[test]
+fn the_mp4_core_reads_its_arguments() {
+    let (code, stdout, stderr) = run_or_skip!("9Nbh3eMuVjD", &["--help"], &[]);
+
+    // Reaching `clap`'s help means `_start` ran, `args_sizes_get` and
+    // `args_get` answered consistently, and the guest parsed what it was
+    // handed. An entry point that exits 71 from its panic handler — which is
+    // what a stale WASI memory window produced — gets to none of this.
+    assert_eq!(code, 0, "--help should succeed: {stderr}");
+    assert!(
+        stdout.contains("check") && stdout.contains("mediautils"),
+        "expected the subcommand list, got: {stdout}"
+    );
+}
+
+#[test]
+fn the_mp4_core_accepts_a_real_clip_and_rejects_garbage() {
+    let (code, stdout, stderr) = run_or_skip!(
+        "9Nbh3eMuVjD",
+        &["mediautils", "mp4check", "in.mp4"],
+        &[("in.mp4", TINY_MP4.to_vec())]
+    );
+    assert_eq!(code, 0, "a real clip should check out: {stdout}{stderr}");
+    assert!(
+        stdout.contains("MP4 file consistency: OK"),
+        "unexpected verdict: {stdout}"
+    );
+
+    let (code, _stdout, stderr) = run_or_skip!(
+        "9Nbh3eMuVjD",
+        &["mediautils", "mp4check", "in.mp4"],
+        &[("in.mp4", b"not an mp4 at all, just text".to_vec())]
+    );
+    assert_ne!(code, 0, "garbage should not check out");
+    // The tool names the error rather than just failing, and the number is
+    // WhatsApp's own: a Rust implementation has to report the same one.
+    assert!(
+        stderr.contains("239: Unknown MP4 box topology"),
+        "expected the wamedia error code, got: {stderr}"
+    );
+}
+
+/// The mimetype classifier, which is what the client calls before it decides a
+/// file is a video at all.
+#[test]
+fn the_mp4_core_classifies_by_content_not_by_name() {
+    let (code, stdout, stderr) = run_or_skip!(
+        "9Nbh3eMuVjD",
+        &["classify", "anything.bin"],
+        &[("anything.bin", TINY_MP4.to_vec())]
+    );
+
+    assert_eq!(code, 0, "classify should succeed: {stderr}");
+    assert!(
+        stdout.contains(r#"Mimetype: Some("video/mp4")"#)
+            && stdout.contains(r#"Extension: Some("mp4")"#),
+        "a real clip under an unrelated name should still classify: {stdout}"
+    );
+}
