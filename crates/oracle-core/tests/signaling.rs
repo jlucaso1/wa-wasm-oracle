@@ -154,7 +154,58 @@ fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
     // threads to finish: PJSIP's worker is a loop bounded only by its fuel, so
     // a full quiesce would always time out.
     wait_for_reaction(&mut runtime, 0);
+
+    // And then wait for the *event thread*, which is a different thing and is
+    // what an offer is handed to.
+    //
+    // `wait_for_reaction` waits for the log to go quiet, and startup is not one
+    // continuous burst of logging: under load it can pause for longer than
+    // `QUIET` between the media stack finishing and `call_event_proc` starting.
+    // An offer delivered into that gap is handled by a half-started engine,
+    // which does not look like a timing problem at all — it looks like the
+    // engine refusing the stanza:
+    //
+    //     record_incoming_msg: no active call
+    //     Application settings not loaded
+    //     Failed to get voip storage dir
+    //
+    // and `wa_call_handle_incoming_xmpp_offer() status 0` never appears. That
+    // is what made `a_well_formed_offer_is_accepted` and
+    // `offer_handling_is_deterministic` fail about one run in seven, on a suite
+    // documented as slow but not flaky.
+    //
+    // `call_event_proc resumed` is the last line startup writes, at the default
+    // log level, and it means the event thread is running and idle. Not
+    // reaching it is a failed startup like any other, so it goes back through
+    // the retry above rather than into a test.
+    if policy == ThreadPolicy::Spawn && !wait_for_line(&mut runtime, "call_event_proc resumed") {
+        return Err(EngineError::InitFailed(
+            "the event thread never announced itself".to_owned(),
+        ));
+    }
     Ok(runtime)
+}
+
+/// Waits for a line to appear in the engine's log, draining as it goes.
+///
+/// Matched on a distinctive substring, and `call_event_proc resumed` is one —
+/// but see the module docs for why that is worth checking every time: the
+/// obvious needle for the call-stack banner turned out to be a substring of an
+/// unrelated line, and the test passed on a stanza that never parsed.
+fn wait_for_line(runtime: &mut Runtime, needle: &str) -> bool {
+    let deadline = std::time::Instant::now() + REACT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if runtime
+            .engine_log()
+            .iter()
+            .any(|line| line.contains(needle))
+        {
+            return true;
+        }
+        runtime.process_queued_calls();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 macro_rules! engine_or_skip {
@@ -263,6 +314,14 @@ fn offer_for(runtime: &Runtime) -> Node {
 }
 
 fn deliver(runtime: &mut Runtime, stanza: String) -> Vec<String> {
+    // Deliberately *not* draining the proxy queue first, and it is worth
+    // knowing why. Work the engine parks for the main thread during startup
+    // looks like something that should run before the offer, so running it
+    // here was tried: `a_well_formed_offer_is_accepted` then fails four times
+    // out of four, where it had been failing about one in five. Whatever that
+    // queued work does, doing it immediately before the offer is worse than
+    // leaving it, which also says the half-started engine below is not simply
+    // "the queue had not been drained".
     let mark = runtime.engine_log().len();
     runtime.clear_calls();
 
