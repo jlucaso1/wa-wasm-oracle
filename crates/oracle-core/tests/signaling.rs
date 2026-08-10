@@ -17,9 +17,8 @@
 //!
 //! # Why these are `#[ignore]`d
 //!
-//! Not because they are unreliable — because they are slow. Each brings up
-//! PJSIP's worker pool under host-driven scheduling, and the file takes about
-//! four minutes:
+//! Because they are slow. Each brings up PJSIP's worker pool under host-driven
+//! scheduling, and the file takes about fifteen minutes:
 //!
 //! ```sh
 //! cargo test --release --test signaling -- --ignored --test-threads 1
@@ -29,7 +28,7 @@
 //!
 //! # What it took to make them reliable
 //!
-//! Two separate problems, both measured rather than guessed:
+//! Four separate problems, each measured rather than guessed:
 //!
 //! - **Startup raced about one time in nine.** `initVoipStack` finishes in
 //!   ~5 ms, and the trap landed with 99.6% of the fuel untouched and the media
@@ -40,6 +39,23 @@
 //! - **Offer handling is asynchronous.** The call returning says nothing about
 //!   whether the event thread has done the work, so `wait_for_reaction` waits
 //!   for the log to grow and then go quiet instead of sleeping a fixed amount.
+//! - **Startup is not one burst of logging**, so "the log went quiet" is not
+//!   "startup finished". Under load the gap between the media stack finishing
+//!   and `call_event_proc` starting exceeds `QUIET`, and an offer delivered
+//!   into it is handled by an engine that has not finished starting.
+//!   `engine_with` waits for `call_event_proc resumed` — the last line startup
+//!   writes — and treats not reaching it as a failed startup.
+//! - **The engine's lock watchdog fires on the offer path**, about one run in
+//!   four, and it is ours: `schedule.rs` lets a worker hold a lock across its
+//!   whole turn, so the main thread meets the engine's locks in an order its
+//!   design does not admit. The run is identical to a good one and then stops
+//!   one line short of `wa_call_handle_incoming_xmpp_offer() status 0`. See
+//!   `deliver_without_a_lock_inversion`, which retries on exactly that
+//!   complaint and on nothing else.
+//!
+//! The last two are why this file used to say "not because they are unreliable
+//! — because they are slow", while `a_well_formed_offer_is_accepted` failed
+//! about one run in four. It was both.
 //!
 //! `examples/init_stress.rs` measures the startup race if the rate needs
 //! rechecking after a capture update.
@@ -184,6 +200,55 @@ fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
         ));
     }
     Ok(runtime)
+}
+
+/// Delivers an offer on a fresh engine until the engine's own lock watchdog
+/// stays quiet, and returns what it logged.
+///
+/// **What is being retried is a harness artifact, not a verdict.** A run that
+/// ends like this —
+///
+/// ```text
+/// events/eve  EVENT: Call missed by the user
+///   wa_os.cc  Mutex scope=0, priority=1: name=, owner=thr0x14b00c, taken=1
+///   wa_os.cc  check_locking_order wrong order for mutex scope=0, priority=0
+/// ```
+///
+/// is byte-for-byte identical to a good one up to that point and then stops:
+/// `wa_call_handle_incoming_xmpp_offer() status 0`, the line the synchronous
+/// call writes on its way out, never arrives. The engine caught a lock-order
+/// inversion and dumped its mutexes instead of finishing.
+///
+/// It is ours. `schedule.rs` runs one guest thread at a time, so a worker can
+/// hold a lock across its whole turn and the main thread meets the engine's
+/// locks in an order its design does not admit. `schedule.rs` says the
+/// lock-order complaints are "a symptom of something else"; this is the
+/// something else, and it is the scheduler that buys everything around it.
+///
+/// So the retry is conditioned on that complaint and nothing else. An engine
+/// that answers — with any status, including a refusal — is returned as it is,
+/// and the test judges it.
+fn deliver_without_a_lock_inversion(runtime: &mut Runtime, stanza: &str) -> Vec<String> {
+    const ATTEMPTS: usize = 8;
+
+    for attempt in 1..=ATTEMPTS {
+        let lines = deliver(runtime, stanza.to_owned());
+        if !lines
+            .iter()
+            .any(|line| line.contains("check_locking_order"))
+        {
+            return lines;
+        }
+        if attempt == ATTEMPTS {
+            return lines;
+        }
+        eprintln!("lock-order inversion handling the offer (attempt {attempt}); fresh engine");
+        let Some(fresh) = engine() else {
+            return lines;
+        };
+        *runtime = fresh;
+    }
+    unreachable!("the loop returns on its last attempt")
 }
 
 /// Waits for a line to appear in the engine's log, draining as it goes.
@@ -564,8 +629,11 @@ fn offer_handling_is_deterministic() {
     let mut second = engine().expect("second instance");
 
     let stanza = serialize(&offer_for(&first), true);
-    let a = events(deliver(&mut first, stanza.clone()));
-    let b = events(deliver(&mut second, stanza));
+    // Both sides through the lock-watchdog retry: an inversion stops the
+    // reaction one line short of `status 0`, and comparing an abandoned run
+    // against a completed one is not a determinism result either way.
+    let a = events(deliver_without_a_lock_inversion(&mut first, &stanza));
+    let b = events(deliver_without_a_lock_inversion(&mut second, &stanza));
 
     assert_eq!(a, b, "two runs reached different engine events");
     assert!(!a.is_empty(), "no events recorded at all");
@@ -783,7 +851,7 @@ fn call_id_must_sit_on_the_call_element() {
 fn a_well_formed_offer_is_accepted() {
     let mut runtime = engine_or_skip!();
     let payload = serialize(&offer_for(&runtime), true);
-    let lines = deliver(&mut runtime, payload);
+    let lines = deliver_without_a_lock_inversion(&mut runtime, &payload);
 
     // A missing line proves nothing once the ring has wrapped: the reader can
     // only return what is still in the buffer. Asserting through an overflow
@@ -828,7 +896,10 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
     };
 
     let payload = serialize(&offer_for(&runtime), true);
-    let _ = deliver(&mut runtime, payload);
+    // Through the lock-watchdog retry: an offer that ended in an inversion left
+    // the engine mid-reaction, and what the call after it does then says
+    // nothing about whether the settings carried over.
+    let _ = deliver_without_a_lock_inversion(&mut runtime, &payload);
 
     let mark = runtime.engine_log().len();
     let _ = runtime.call_embind(

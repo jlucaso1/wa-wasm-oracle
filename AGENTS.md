@@ -117,16 +117,23 @@ Host environment, in the order a module exercises it:
   only ends when its fuel runs out, so finished tests kept burning CPU. `Drop`
   signals a shutdown that every host call checks.
 
-## The signaling tests are slow, not flaky
+## The signaling tests are slow, and were flakier than this file claimed
 
-They bring up PJSIP's worker pool and take about four minutes, so they are
+They bring up PJSIP's worker pool and take about fifteen minutes, so they are
 `#[ignore]`d and run on their own:
 
 ```sh
 cargo test --release --test signaling -- --ignored --test-threads 1
 ```
 
-They used to be genuinely unreliable, and what fixed it is worth knowing:
+This heading used to end at "not flaky", while `a_well_formed_offer_is_accepted`
+failed about one run in four. Two more causes are now found and handled, both in
+the module docs of `signaling.rs`: startup returning before `call_event_proc`
+exists, and the engine's own lock watchdog firing on the offer path — the second
+is `schedule.rs`'s doing, and the retry for it is conditioned on that complaint
+and nothing else, so a real refusal still fails the test.
+
+What was already known, and still holds:
 
 - **Startup raced about one time in nine.** Measured with
   `examples/init_stress.rs`: `initVoipStack` finishes in ~5 ms, and the trap
