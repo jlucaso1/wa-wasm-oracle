@@ -717,6 +717,65 @@ fn the_log_reader_returns_only_the_log() {
     }
 }
 
+/// The log is withheld when the host's view of guest memory has gone wrong.
+///
+/// About one run in four, an incoming offer followed by an outgoing call leaves
+/// the host reading entirely different bytes from the guest, and the ring comes
+/// back as hundreds of lines of high-entropy noise. `engine_log` refuses in
+/// that case — but waiting for a 1-in-4 fault to demonstrate the refusal is not
+/// a test, it is a hope. Five consecutive runs of
+/// `settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` came back
+/// healthy and said nothing about whether the refusal works.
+///
+/// So the fault is induced instead: overwrite the witness and the log must go
+/// away; put it back and the log must return. The second half is what makes
+/// this a test of a live check rather than of a latch that trips once.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn an_incoherent_memory_view_withholds_the_log() {
+    let _serial = threaded_guard();
+    let mut runtime = engine_or_skip!();
+
+    let (at, len) = runtime
+        .coherence_witness()
+        .expect("no witness: the module placed no static data to watch");
+    let original = runtime.read(at, len).expect("read witness");
+
+    assert_eq!(runtime.memory_view_is_coherent(), Some(true));
+    assert!(
+        !runtime.engine_log().is_empty(),
+        "engine produced no log to withhold"
+    );
+
+    runtime
+        .write_bytes_at(at, &vec![0xFF; original.len()])
+        .expect("clobber witness");
+
+    assert_eq!(runtime.memory_view_is_coherent(), Some(false));
+    assert!(
+        runtime.engine_log().is_empty(),
+        "the log was returned from a view known to be wrong"
+    );
+    assert!(
+        runtime
+            .logs()
+            .iter()
+            .any(|line| line.contains("engine log withheld")),
+        "the refusal was silent; a caller has no way to tell it apart from an empty log"
+    );
+
+    // Static data is written once and read forever, so restoring it leaves the
+    // guest exactly as it was — which is also why it is the right thing to
+    // watch.
+    runtime.write_bytes_at(at, &original).expect("restore");
+
+    assert_eq!(runtime.memory_view_is_coherent(), Some(true));
+    assert!(
+        !runtime.engine_log().is_empty(),
+        "the log did not come back once the view was good again"
+    );
+}
+
 /// A module with no ring attached has no log, rather than whatever its heap
 /// happens to contain.
 #[test]

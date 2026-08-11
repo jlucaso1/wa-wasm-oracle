@@ -1009,6 +1009,18 @@ impl Runtime {
         Some(self.read(*at, len).is_ok_and(|actual| actual == *expected))
     }
 
+    /// Where the coherence witness sits, and how long it is.
+    ///
+    /// Exposed so a caller can clobber it on purpose. The fault this guards
+    /// against appears about one run in four, which is no basis at all for
+    /// believing the refusal fires — five consecutive healthy runs of
+    /// `settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` proved
+    /// exactly nothing about it.
+    pub fn coherence_witness(&self) -> Option<(u32, u32)> {
+        let (at, expected) = self.canary.as_ref()?;
+        Some((*at, u32::try_from(expected.len()).ok()?))
+    }
+
     pub fn log_ring(&self) -> Option<(u32, u32)> {
         self.log_ring
     }

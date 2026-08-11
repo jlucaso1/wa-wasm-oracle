@@ -494,8 +494,8 @@ fn round(bytes: &[u8], index: usize) -> bool {
                 if intact { "intact" } else { "DESTROYED" }
             );
         }
-        println!("     header before {:02x?}", &before.header);
-        println!("     header after  {:02x?}", &after.header);
+        println!("     header before {:02x?}", before.header);
+        println!("     header after  {:02x?}", after.header);
         match damage(&before, &after) {
             Some((first, last, clobbered)) => {
                 println!(

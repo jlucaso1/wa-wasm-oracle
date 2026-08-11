@@ -1264,6 +1264,14 @@ watch until it has been placed.
 outcome exactly: `Some(false)` on every corrupt round, `Some(true)` on every
 healthy one.
 
+The refusal itself is tested by inducing the fault rather than by waiting for
+it. `an_incoherent_memory_view_withholds_the_log` overwrites the witness through
+`coherence_witness()`, asserts the log goes away and the host says why, then
+restores it and asserts the log comes back — the second half being what
+distinguishes a live check from a latch that trips once. Waiting was tried
+first: five consecutive runs of the 1-in-4 test came back healthy and
+established nothing.
+
 `settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` is still the
 test that catches it, at about one run in four. What it now asserts is what it
 can establish — whatever the engine did say has the shape of engine output — and

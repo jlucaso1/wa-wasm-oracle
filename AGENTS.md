@@ -16,6 +16,11 @@ cargo machete                 # no unused dependencies
 accumulated behind the gap was a dead helper carrying `flate2` — a whole
 dependency kept alive by a function nothing called.
 
+CI runs `stable`, which is ahead of the toolchain in this container. A clean
+local clippy is therefore not a clean CI clippy: `useless_borrows_in_formatting`
+failed the lint job on lines 1.94 accepts. When CI reports a lint you cannot
+reproduce, the version gap is the first thing to check, not the last.
+
 Always `--release` for anything that executes a module. In a debug build
 Cranelift compiles the 9.3 MiB VoIP module so slowly that runs look hung.
 
@@ -200,7 +205,10 @@ so it works on captures that do not exist yet. The order that has paid off:
    witness **after `run_ctors`**: a shared-memory build's data segments are
    passive, so at instantiation there is nothing placed to watch and the check
    answers `None` on every run — absent rather than wrong, which is the hard
-   kind of broken to notice.
+   kind of broken to notice. `an_incoherent_memory_view_withholds_the_log`
+   induces the fault through `coherence_witness()` instead of waiting for it,
+   because a guard against a 1-in-4 event that is only ever exercised by that
+   event is a guard nobody has seen work.
 3. **Drive a full call flow**: `initVoipStack` then
    `handleIncomingSignalingOffer`, and compare the recorded
    `sendSignalingXMPP_js_sync` payloads against what whatsapp-rust emits. The
