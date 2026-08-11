@@ -56,6 +56,15 @@ different code. Treat a capture bump as a re-derivation, never as an update.
   unregistered — so every call a worker queued for it was dropped, and the
   symptom surfaced thousands of instructions away. A miss now names the near
   misses, normalising leading underscores and case.
+- **A host import's declared type is not its argument order.** `(i32, i32)`
+  says nothing about which one is the buffer. `env::get_random_bytes_js` takes
+  `(len, buf)`, the host had it as `(buf, len)` by analogy with the
+  `getentropy(buf, len)` sitting directly above it, and a request for 32 bytes
+  at `0xf00000` became fifteen megabytes of PRNG written from address 32. That
+  one transposition was the ring corruption, the `free`-refusing-a-pointer trap,
+  and every "host and guest read different memory" theory this repository
+  accumulated. Read the call site: the bytecode pushes the constant, and
+  `oracle abi --index` shows it.
 - **Determinism is the product.** Anything that would vary between runs — clocks,
   randomness, filesystem — must be replaced by something reproducible. A
   comparison against whatsapp-rust is worthless if the oracle's own output
@@ -184,41 +193,13 @@ so it works on captures that do not exist yet. The order that has paid off:
    null, and three static facts say it cannot be — see "What `l1` is" in
    `VOIP_STATUS.md`. One of the two is measuring something else, and the probe
    is the newer and less certain of them.
-2. **What writes over the guest heap.** Two symptoms, one bug, and it is
-   upstream of most of the rest of this list.
-
-   `f1139` → `f763` → `f13513` → `f13089` is a container destructor inside
-   `startVoipCall`'s embind wrapper handing `free` a pointer it refuses. It
-   shows up whichever stack the workers use — see "Giving each thread its own
-   stack works, and is still not the fix" — so it predates every explanation
-   offered for it so far.
-
-   The other symptom is readable rather than fatal, and it is not what it
-   looked like. About one run in four,
-   `settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` finds the
-   engine's log ring full of high-entropy bytes with the ring not overflowed.
-   `examples/ring_corruption.rs` measured it: it is not the ring, it is *all*
-   of linear memory — one changed span from `0xd` to the end, 83% zeroes down
-   to 3%, a 64 KiB guard block gone rather than moved, static string data
-   unreadable — while `emscripten_stack_get_base` still answers `0x24cf60`, so
-   the guest is executing correctly throughout. Host writes, the host's entropy
-   source, a moved mapping and memory growth are each excluded by measurement;
-   see "Nothing writes key-shaped bytes over a live allocation" in
-   `VOIP_STATUS.md`. Note while you are there that wasmtime freezes a shared
-   memory's base at creation, so the host cannot detect a move even if one
-   happened.
-
-   The fault is open; the oracle answering from it is not.
-   `Runtime::memory_view_is_coherent` re-reads a slice of the module's own
-   static data and `engine_log` returns nothing when it no longer matches,
-   because a wrong answer from an oracle is worse than no answer. Take that
-   witness **after `run_ctors`**: a shared-memory build's data segments are
-   passive, so at instantiation there is nothing placed to watch and the check
-   answers `None` on every run — absent rather than wrong, which is the hard
-   kind of broken to notice. `an_incoherent_memory_view_withholds_the_log`
-   induces the fault through `coherence_witness()` instead of waiting for it,
-   because a guard against a 1-in-4 event that is only ever exercised by that
-   event is a guard nobody has seen work.
+2. **Guest threads run concurrently, on one stack.** Not the corruption — that
+   is fixed, see below — but real, measured, and load-bearing for anything
+   written near `schedule.rs`. `Runtime::max_threads_in_wasm()` peaks at five or
+   six when the design says one. Serialising properly is correct and unusable,
+   and giving each worker its own stack makes things worse by every route tried.
+   `VOIP_STATUS.md`, "Guest threads run concurrently, on one stack", has the
+   numbers.
 3. **Drive a full call flow**: `initVoipStack` then
    `handleIncomingSignalingOffer`, and compare the recorded
    `sendSignalingXMPP_js_sync` payloads against what whatsapp-rust emits. The
@@ -226,7 +207,13 @@ so it works on captures that do not exist yet. The order that has paid off:
    main-thread proxy queue — see `state.rs`: the engine queues its outbound
    stanzas there and every drain fails while `register_main_thread` is off.
    `init_stress --register-main-thread` measures what turning it on costs.
-4. **What corrupts memory in `examples/outgoing_call.rs`.** It ends with traps
+4. **Re-check `examples/outgoing_call.rs`.** It used to end with corrupted
+   memory whichever stack the workers used, which is exactly what the
+   `get_random_bytes_js` transposition did to anything that reached key
+   generation. It has not been re-run since that was fixed. What follows is the
+   pre-fix note:
+
+   **What corrupts memory in `examples/outgoing_call.rs`.** It ends with traps
    whichever stack the workers use, while `examples/profiler_flag.rs` — same
    engine, same log level, same assert gate — has none. `startJsWorkerThread`
    and `initSctpRingBuffer` are what remain untested between them.

@@ -1053,24 +1053,20 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
 
     let lines = runtime.engine_log_from(mark);
 
-    // What this used to assert, and why it no longer does.
+    // What this used to assert, and what it took to get here.
     //
     // About one run in four the ring came back holding 880 lines of
     // high-entropy noise — `"E'8da(R#"`, `"8+bb=BX+"` — and this test read that
-    // as the engine's state being corrupted by the sequence. It is not.
-    // `examples/ring_corruption.rs` measured it: *all* of linear memory reads
-    // differently, static string literals included, while the guest keeps
-    // executing correctly — `emscripten_stack_get_base` still answers
-    // `0x24cf60`. The host's view of guest memory is what breaks, not the
-    // engine.
+    // as the engine's state being corrupted by the sequence. The noise was real
+    // and the reading was wrong twice over: it was not the ring, it was all of
+    // linear memory; and it was not the engine, it was **this host**.
     //
-    // So the oracle now refuses rather than answering: `engine_log` checks a
-    // slice of the module's own static data and returns nothing when it no
-    // longer matches. A wrong answer from an oracle is worse than no answer,
-    // and hundreds of lines of noise presented as engine output is a wrong
-    // answer. That leaves this test asserting what it can actually establish —
-    // whatever the engine did say has the shape of engine output — and saying
-    // plainly when it could not look.
+    // `env::get_random_bytes_js` takes `(len, buf)`, and the host had it as
+    // `(buf, len)`. The module's only caller of it is the crypto callback that
+    // `generate_raw_e2e_keys` dispatches through, which asks for 32 bytes; with
+    // the arguments swapped that became fifteen megabytes of the host's own
+    // PRNG written from address 32. The bytes really were key material, and the
+    // host was the one writing them.
     let structured = lines
         .iter()
         .filter(|line| line.contains(".c") || line.contains("EVENT") || line.contains("call"))
@@ -1084,19 +1080,24 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
         eprintln!("  SAMPLE {line:?}");
     }
 
-    // Named rather than silent: a run that could not look is not a run that
-    // looked and found nothing, and a green suite should still say which it was.
-    if runtime.memory_view_is_coherent() == Some(false) {
-        eprintln!(
-            "the host's view of guest memory went incoherent during this sequence, so the \
-             engine's log could not be read — see VOIP_STATUS.md, \"Nothing writes key-shaped \
-             bytes over a live allocation\", and examples/ring_corruption.rs to reproduce it"
-        );
-    }
+    // This is the regression guard for the swapped `get_random_bytes_js`
+    // arguments, and it is an assertion now rather than an `eprintln!`.
+    //
+    // For as long as the host read that import as `(buf, len)` instead of
+    // `(len, buf)`, this sequence destroyed the whole of linear memory about
+    // one run in four — a request for 32 bytes at `0xf00000` became fifteen
+    // megabytes of PRNG output written from address 32. The test tolerated it,
+    // because the cause was unknown and a red suite that could not be fixed
+    // teaches nobody anything. The cause is known, so the tolerance goes.
+    assert_ne!(
+        runtime.memory_view_is_coherent(),
+        Some(false),
+        "the host's view of guest memory went incoherent during offer-then-call — \
+         the corruption this used to tolerate is back; see `get_random_bytes_js` in \
+         emscripten.rs and examples/ring_corruption.rs"
+    );
 
-    // The invariant that survives the correction: anything the engine *did*
-    // write has the shape of engine output. Noise reaching this point would
-    // mean the refusal above failed to fire.
+    // And anything the engine did write has the shape of engine output.
     assert!(
         lines.is_empty() || structured > 0,
         "the log has lines but none of them are engine output: {lines:?}"

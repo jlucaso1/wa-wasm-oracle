@@ -1163,265 +1163,120 @@ wasm has no guard page, and the engine's own frames are not small —
 `start_call_md` alone takes 4,176 bytes plus a 3,856-byte `memory.fill`. It is
 the first thing to account for before re-trying this.
 
-### Nothing writes key-shaped bytes over a live allocation
+### The host was writing the key material itself
 
-That was the reading, and `examples/ring_corruption.rs` was written to chase it
-by watching the ring's base and length — both of which the host knows — across
-the sequence that breaks it. It found something else.
+**`env::get_random_bytes_js` takes `(len, buf)`. This host had it as
+`(buf, len)`.** That one transposition is the whole of the ring corruption, the
+`free`-refusing-a-pointer trap, and every "the host and the guest read different
+memory" theory in the history of this file.
 
-**The whole of linear memory changes, not the ring.** A healthy round differs in
-about 372 KB across ~539 spans, which is heap and stack churn. A bad one differs
-in a *single span from `0xd` to the last byte*. Zero bytes fall from 83% of the
-image to 3%. A 64 KiB guard block of `0xA5` allocated either side of the ring is
-absent afterwards — not relocated, absent. A string literal in static data —
-placed once by `memory.init` and never written again — reads as noise.
-
-**That last paragraph used to end "and the guest is fine while that is true",
-and it was wrong.** The evidence offered was that `emscripten_stack_get_base`
-still answers `0x24cf60` at that moment. Read the function:
+The module's only caller of it is the crypto callback in function-table slot 298
+that `generate_raw_e2e_keys` (`wa_call_participant_crypto.cc`) dispatches
+through, and its bytecode leaves nothing to interpret:
 
 ```
-emscripten_stack_get_base (function #593)
-  global.get 8
-  end
+f649:   i32.const 32      ; the length — this callback rejects any other
+        local.get 0       ; the destination
+        call 8            ; env::get_random_bytes_js
 ```
 
-It returns a **wasm global**. Globals live in the store, not in linear memory,
-so that answer is exactly as correct on a module whose memory has been wiped as
-on a healthy one. It never was evidence about memory, and everything built on
-it — "the host is looking somewhere else", "the guest is executing correctly
-throughout" — was built on nothing.
+Read with the arguments swapped, a request for 32 bytes at `0xf00000` becomes
+**fifteen megabytes of the host's own PRNG written from address 32**. Every
+symptom follows from that and nothing else is needed to explain any of them:
 
-What the same instrument says when asked properly: **the guest's own `malloc`
-traps** in a corrupt round, and so does `getWebP2PVirtualIpv4`. The guest agrees
-with the host. Linear memory really is destroyed.
-
-The third row of the table below can go too, for a separate reason.
-`memory_may_move(false)` with a 4 GiB reservation "did not help" because it
-changed nothing: wasmtime's 64-bit default `memory_reservation` is **already**
-`1 << 32`, and `ty.maximum_byte_size() <= alloc_bytes` zeroes
-`extra_to_reserve_on_growth`, so the mapping is reserved once at 4 GiB and a
-17 MB heap never approaches it. The mapping cannot move, the frozen base is
-correct, and the host and guest are reading the same bytes.
-
-Four mechanisms are ruled out, each by measurement:
-
-| candidate | how it was excluded |
+| symptom | what it was |
 | --- | --- |
-| a host call wrote it | instrumenting every host write ≥ 64 KiB finds only the probe's own guards |
-| the host's entropy source wrote it | `getentropy`/`get_random_bytes_js` is never called below the heap or in chunks over 4 KiB |
-| the mapping moved | `SharedMemory::data()` reports the same base before and after — but see below |
-| memory growth triggered it | pre-growing to a fixed 64 MiB at creation, so the guest never calls `grow`, does not stop it |
+| high-entropy bytes that "look like key material" | they *are* key material: the host's PRNG, on the key-generation path |
+| the whole image changed, one span, 83% zeroes down to 3% | one write covering almost all of memory |
+| the ring destroyed with `getLogRingBufferOverflowCount` zero | the ring was simply inside the range |
+| the guest's own `malloc` trapping afterwards | its heap was inside the range too |
+| the 64 KiB `0xA5` guard block absent rather than moved | overwritten, like everything else |
+| `free` refusing a pointer inside `startVoipCall` | same write, caught where it traps instead of where it reads |
 
-The third of those is weaker than it looks and the note matters more than the
-result: wasmtime freezes a shared memory's `base` in its `VMMemoryDefinition`
-when the memory is created, and `grow` updates only `current_length`. So
-`SharedMemory::data()` *cannot* observe a move, and the host has no way to ask.
-Whatever else is true, that is a hazard this harness is exposed to and cannot
-currently detect.
+**And it explains the exact discriminator**, which was the sharpest clue on the
+table and was pointing the right way all along. `HostState::write` refuses an
+out-of-bounds range, so the bogus write only lands when `32 + destination` still
+fits inside linear memory. A round that grew to `0x10e0000` had room and was
+destroyed; a round that stopped at `0xf10000` did not and survived untouched.
+Two values, not a distribution, because it was not a correlation — the heap size
+*decided* whether the write was refused.
 
-**One correlation survives, and it is exact.** A healthy round ends with four
-guest worker threads live; a corrupt one ends with one. Every round observed so
-far falls on one side or the other with nothing in between, so three workers
-trapping mid-call and the host's whole image of memory going wrong are not
-independent events.
+Measured: **8 corrupt rounds of 8 became 8 clean rounds of 8**, and a round
+reaching `0x10e0000` — previously an exact predictor of corruption — now
+completes healthy with 61 structured log lines.
 
-Which way the arrow points is now known, because the obvious intervention was
-tried. `threads.rs` runs `_emscripten_thread_exit` on a worker even when its
-routine trapped — teardown against whatever state the trap left, including a
-heap lock the guest may still believe is held. Skipping it for a trapped thread
-looks obviously safer. It is **three rounds of four corrupt**, against about one
-in four with it. So the teardown is load-bearing even after a trap, and worker
-death is upstream of the corruption rather than downstream of it.
+`settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` asserts
+coherence now rather than tolerating its absence.
 
-Two further facts, both from the same instrument:
+#### How it hid for so long
 
-* **The discriminator is exact, and it is the heap size.** Every round, under
-  every configuration tried: a corrupt run ends with the guest heap at
-  `0x10e0000` and a healthy one at `0xf10000`. Not a distribution — two values,
-  and which one you get is which outcome you get. Something takes a different
-  path and allocates about 1.9 MB more, and that is a better handle than the
-  thread count because it does not move when the profiler is patched out.
-* **The end state is settled.** Reading the whole image twice in a row returns
-  identical bytes, so nothing here is a torn read of memory still being written.
+Worth recording, because every one of these was a reasonable-looking step in the
+wrong direction:
 
-Neutralising the thread-status profiler is worth knowing about too: it saves two
-of the workers — a corrupt round then ends with three live instead of one — and
-does not stop the corruption. So the profiler traps are a consequence, not the
-path.
+* **The declared type does not disambiguate.** `(i32, i32)` is what the module
+  says, and `getentropy(buf, len)` sits directly above it in `emscripten.rs`.
+  This is not a standard emscripten import — it is WhatsApp's own — so the
+  convention that made the guess feel safe never applied.
+* **The host's randomness had been "excluded by measurement".** Twice. The first
+  pass instrumented writes of 64 KiB or more and found only the probe's own
+  guard fills — but that instrumentation was watching `HostState::write` call
+  sites it knew about. The second pass counted `fill_random` calls through
+  `calls_to`, which reads the argument-carrying trace, and that trace stops at
+  8192 entries while a round makes fifty million host calls. It answered "never
+  called" about a function that was called. The counts in `hot_calls` are
+  unbounded and are what such a question needs.
+* **`emscripten_stack_get_base` was treated as evidence.** Its body is
+  `global.get 8; end` — a wasm global, which lives in the store, not in memory.
+  It answers identically on a wiped module and a healthy one. Everything built
+  on "the guest is fine, so the host must be looking elsewhere" was built on
+  that.
 
-And one fact about this host that the search turned up on the way, true of every
-round rather than only the bad ones: **most of the heap growth never reaches
-`emscripten_resize_heap`**. Logging every call shows the host being asked for the
-first 166 pages and no more, while the memory ends at 241 or 270 — the rest is
-the guest executing `memory.grow` itself. The host therefore maintains its view
-of a memory whose size it is not told about, which is worth knowing before
-trusting anything the host caches about that memory.
+Two real defects were found on the way and are documented below rather than
+fixed, because neither turned out to cause this and both remain true: guest
+threads run concurrently when the design says they must not, and they all start
+from the same stack pointer.
 
-### What is actually wrong: guest threads run concurrently on one stack
+### Guest threads run concurrently, on one stack
 
-Measured, and it is the harness's own defect rather than the module's.
+Found while chasing the corruption above, unrelated to it, and true regardless.
 
-**Up to six guest threads execute at the same time.** `examples/ring_corruption.rs`
-counts it: `SharedHost::entered_wasm`/`left_wasm` bracket every crossing of the
-host boundary in the store's `call_hook`, and `max_threads_in_wasm()` reports
-the peak. It must be 1. It is 5 or 6 in every round, healthy and corrupt alike.
+**Up to six guest threads execute at the same time.** `max_threads_in_wasm()`
+counts it, bracketing every crossing of the host boundary in the store's
+`call_hook`. It must be 1. It is 5 or 6 in every round, healthy and corrupt
+alike.
 
-`schedule.rs` was supposed to prevent that and cannot, as written. A thread
-acquires the turn **once**, around its whole routine, and `yield_point` hands it
-on only while `waiting > 0` — that is, only while some other thread is blocked
-in its own first `acquire`. Once every worker has forced its way past
-`TURN_TIMEOUT`, nothing is ever waiting again, so nothing ever yields and every
-thread runs freely. The `func_wrap` gap makes it worse — a PJSIP worker sitting
-in `pj_thread_sleep` reaches `emscripten_get_now` and nothing else, and that
-import is defined with `Linker::func_wrap`, so it passes through neither
-`host_func` nor `yield_point`.
+`schedule.rs` cannot prevent that as written. A thread acquires the turn once,
+around its whole routine, and `yield_point` hands it on only while `waiting > 0`
+— that is, only while some other thread is blocked in its own first `acquire`.
+Once every worker has forced its way past `TURN_TIMEOUT`, nothing is waiting
+again, so nothing ever yields. The `func_wrap` gap makes it worse: a PJSIP
+worker sitting in `pj_thread_sleep` reaches `emscripten_get_now` and nothing
+else, and that import passes through neither `host_func` nor `yield_point`.
 
-**And every guest thread starts from the same stack pointer.** The stack pointer
-is a per-instance wasm global, every instance is initialised from the same
-module, and `__emscripten_thread_init` sets the TLS globals and nothing else. So
-each thread begins at `0x24cf60` — the main thread's own region — and pushes its
-frames over whatever is live there. Six call stacks, one address range.
+**And every guest thread starts from the same stack pointer.** It is a
+per-instance wasm global, every instance is initialised from the same module,
+and `__emscripten_thread_init` sets the TLS globals and nothing else. So each
+thread begins at `0x24cf60`, the main thread's own region.
 
-Two things follow, and only the first is settled:
+Neither is fixed, and the measurements say why:
 
-* The old measurements that "ruled out" the shared stack were taken while this
-  was true, so they ruled out nothing: the run they compared against was also
-  running several threads over each other.
-* Making the turn cover exactly the guest-execution window — `acquire` on the
-  way into wasm, `release` on the way out, both in the `call_hook` — does
-  serialise, and is **unusable**: a round that takes two minutes had not
-  finished one in ten. That is `TURN_TIMEOUT`'s reason for existing showing up
-  as latency instead of deadlock, because a worker blocked in
-  `memory.atomic.wait32` holds the turn from inside wasm where nothing can take
-  it back. Serialising and letting workers block are not both available.
+* Serialising properly — holding the turn across exactly the guest-execution
+  window, acquired and released in the `call_hook` — is correct and unusable. A
+  two-minute round had not finished in ten, and cutting the turn timeout from
+  five seconds to 25 ms did not help: under strict turns every crossing takes
+  the scheduler lock, and a worker polling the clock crosses tens of millions of
+  times per round. `Runtime::demand_strict_turns` exposes it for an
+  investigator who wants attribution and can wait.
+* Giving each worker its own stack makes things strictly worse, three times over
+  — 64 KiB from the guest's own `pthread_create` traps `startVoipCall` four
+  attempts of four, 4 MiB "changes nothing", and 1 MiB installed through the
+  module's own exports gave 8 corrupt rounds of 8 against a baseline of one in
+  four. That contradiction is still unexplained; it is now a curiosity rather
+  than a lead, since the corruption it was competing to explain has a cause.
 
-The consequence for the rest of this file: **concurrency here is not a bug to be
-scheduled away, it is the environment the module was built for**, and a browser
-gives each of those threads its own stack. This host did not.
-
-### What the watch establishes about the write itself
-
-`Runtime::watch_memory` compares a 64-byte span of static data on both
-directions of every host boundary. Three facts came out of it:
-
-* **The damage is progressive, not one wild store.** At the first sighting the
-  memory is 82%, 79% or 67% zero bytes depending on the round, against 83%
-  healthy and 3% at the end. Something writes for a while.
-* **Memory has already grown to its final corrupt size before the damage
-  starts.** The `0x10e0000`-versus-`0xf10000` discriminator is upstream of the
-  overwrite, not a consequence of it.
-* **The host's randomness is not the source.** The earlier pass excluded it by
-  instrumenting writes of 64 KiB or more, which says nothing about the same
-  total arriving in 4 KiB pieces. Counted properly — every `fill_random` call
-  recorded, no size filter — a corrupt round makes **zero** of them.
-
-Attribution is the one thing the watch cannot yet give. "The span was intact
-when this thread entered wasm and broken when it returned" is only sound while
-one thread runs at a time; with six, four threads report it at once and all four
-reports are worthless. Fixing the concurrency is a precondition for naming the
-writer, not an alternative to it.
-
-Switching to strict turns *when the watch fires* looks like a way out of that
-and is not: attribution catches the transition from intact to broken, and by the
-time anything has noticed, the transition is over. Measured — with it on, a
-corrupt round produces ten sightings and every one of them says "already broken
-before this thread ran", correctly and uselessly. `Runtime::demand_strict_turns`
-is therefore something to switch on *before* the operation under suspicion —
-`ring_corruption --strict` does exactly that, for the duration of
-`startVoipCall` and nothing else.
-
-That has been tried, including with the turn timeout cut from five seconds to
-25 ms so the degradation is graceful rather than a stall per crossing. **It
-still does not finish a round in ten minutes.** The reason is the crossing rate
-rather than the timeout: under strict turns every crossing of the host boundary
-takes the scheduler lock, and a guest worker polling the clock crosses it
-millions of times per round. Serialising this host is not affordable at any
-timeout, and an attribution scheme that needs it is not going to work either.
-
-What is left, in the order worth trying:
-
-1. **Narrow the window instead of the concurrency.** Watch a span, and when it
-   breaks, look at *what replaced it* rather than at who was running. Ten
-   megabytes of high-entropy bytes came from somewhere; if they are a copy of
-   another region, the shift names the instruction, and if they are not, that
-   rules out `memory.copy` and leaves a generator.
-2. **Ask why separate stacks make it worse**, which is the sharpest
-   contradiction on the table. Three independent attempts, three regressions,
-   and no theory that survives — something the guest believes about a thread's
-   stack disagrees with what this host tells it. `+52`/`+56` in the pthread and
-   the `emscripten_stack_*` globals are the two places that belief could live.
-3. **Check what the guest does with `__pthread_create_js` and
-   `__emscripten_thread_cleanup`**, the two thread-lifecycle imports this host
-   answers. Worker death is upstream of the corruption, and those are where a
-   worker's death is negotiated.
-
-#### What is fixed, and what is not
-
-The fault is not fixed. What is fixed is the oracle answering from it.
-
-`Runtime::memory_view_is_coherent` remembers a 256-byte slice of the module's
-own static data and re-reads it on demand; `engine_log` returns nothing, and
-says so in the host log, when the slice no longer matches. Hundreds of lines of
-high-entropy noise handed back as engine output is a wrong answer, and a wrong
-answer from an oracle is worse than no answer.
-
-Two details are load-bearing, and the first cost a wasted verification run.
-**The witness has to be taken after `run_ctors`, not at instantiation.** A
-shared-memory build carries *passive* data segments: they name no static offset,
-and `memory.init` places them from `__wasm_init_memory`, which wasm-ld calls at
-the top of `__wasm_call_ctors` because this module has no start section. Sampled
-at instantiation, memory is still zeroed, nothing is found, and
-`memory_view_is_coherent` answers `None` on every run — the guard silently
-absent rather than wrong. Second, it is read out of memory rather than out of
-the segment table for the same reason: a passive segment has no address to
-watch until it has been placed.
-
-`examples/ring_corruption.rs` prints the check per round, and it agrees with the
-outcome exactly: `Some(false)` on every corrupt round, `Some(true)` on every
-healthy one.
-
-The refusal itself is tested by inducing the fault rather than by waiting for
-it. `an_incoherent_memory_view_withholds_the_log` overwrites the witness through
-`coherence_witness()`, asserts the log goes away and the host says why, then
-restores it and asserts the log comes back — the second half being what
-distinguishes a live check from a latch that trips once. Waiting was tried
-first: five consecutive runs of the 1-in-4 test came back healthy and
-established nothing.
-
-`settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` is still the
-test that catches it, at about one run in four. What it now asserts is what it
-can establish — whatever the engine did say has the shape of engine output — and
-it names the incoherent runs on stderr, because a run that could not look is not
-a run that looked and found nothing.
-
-### What this replaces: something writes key-shaped bytes over a live allocation
-
-The `free`-refusing-a-pointer trap has a second symptom, and this one can be
-read rather than only crashed into. About one run in four,
-`settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` comes back
-with the engine's log ring holding 880 lines of this:
-
-```
-"E'8da(R#"  "8+bb=BX+"  "{wP>Lc$C"  "6?U,f|n>"  "dpDe?-o/"  "hHe&kd7U"
-```
-
-High entropy, no structure, and — this is the part that matters —
-`engine_log_overflowed()` is **false**, so it is not the reader running past
-what it may read. The ring is a plain `malloc` in the guest heap that
-`attach_log_ring` hands to `initLogRingBuffer`; WhatsApp Web does the same. So
-something wrote over a live allocation, and during call setup the obvious
-candidate for bytes that look like that is key material.
-
-The other three runs in four come back with 31-34 structured lines and the ring
-intact, from the same code and the same input.
-
-That makes this the cheapest handle on the corruption behind the trap: it lands
-somewhere with a known base address and a known length, both held by the host,
-instead of somewhere that only shows up when `free` refuses the result. What it
-needs next is the allocation's neighbours — what `startVoipCall` allocates
-immediately before and after the ring, and whether the overwrite starts at the
-ring's base or partway in.
+Do not write code whose safety argument is "the scheduler holds all but one
+thread outside guest code". `HostState::read`'s SAFETY note is the one place
+that still says it.
 
 ### The profiler flag is 5,640 bytes below the main stack
 

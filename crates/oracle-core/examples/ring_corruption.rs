@@ -1,97 +1,65 @@
-//! What actually happens when the engine's log ring "fills with garbage".
+//! What actually happened when the engine's log ring "filled with garbage".
 //!
-//! About one run in four, an incoming offer followed by an outgoing call leaves
-//! the ring holding high-entropy bytes instead of messages — `"E'8da(R#"`,
-//! `"8+bb=BX+"` — with `getLogRingBufferOverflowCount` still zero. That was
-//! recorded as a write over a live allocation. It is not one, and it is not
-//! confined to the ring either.
+//! **Found, and fixed.** `env::get_random_bytes_js` takes `(len, buf)` and this
+//! host had it as `(buf, len)`. The module's only caller is the crypto callback
+//! that `generate_raw_e2e_keys` dispatches through, and it asks for 32 bytes:
 //!
-//! # What this establishes
+//! ```text
+//! f649:   i32.const 32      ; the length — this callback rejects any other
+//!         local.get 0       ; the destination
+//!         call 8            ; env::get_random_bytes_js
+//! ```
+//!
+//! Read backwards, a request for 32 bytes at `0xf00000` becomes **fifteen
+//! megabytes of the host's own PRNG written from address 32**. The bytes that
+//! looked like key material were key material, and the host was writing them.
+//! Measured here: 8 corrupt rounds of 8 became 8 clean rounds of 8.
+//!
+//! This example is kept because it is what found it, and because the same
+//! shapes will be wanted for the next one.
+//!
+//! # What it measures
 //!
 //! Each round brings an engine up, hands it an offer, snapshots *all* of linear
 //! memory, starts a call, and snapshots again.
 //!
-//! 1. **The whole memory changes, not the ring.** A healthy round differs in
-//!    ~372 KB across ~539 spans — heap and stack churn. A bad one differs in a
-//!    single span from `0xd` to the end of the pre-call image. Zero bytes fall
-//!    from 83% to 3%, a 64 KiB guard block of `0xA5` either side of the ring is
-//!    *absent* rather than moved, and static string data reads as noise.
-//! 2. **The guest agrees.** Its own `malloc` traps, and so does
-//!    `getWebP2PVirtualIpv4`. Linear memory really is destroyed — this is not
-//!    the host reading the wrong place.
+//! * **The diff, with a healthy round as the control.** ~372 KB across ~539
+//!   spans is normal churn; the failure was one span covering everything, with
+//!   zero bytes falling from 83% to 3%.
+//! * **`memory_view_is_coherent()`**, which re-reads a slice of the module's
+//!   own static data. `engine_log` returns nothing when it disagrees, because
+//!   hundreds of lines of noise presented as engine output is a wrong answer.
+//!   The line counts below deliberately read the ring's bytes directly instead,
+//!   since an instrument has to see what the refusal hides.
+//! * **`watch_memory()`**, which compares a span on both directions of every
+//!   host boundary and names the thread and guest stack that first sees it
+//!   change. Its "this thread wrote it" is only sound while one thread runs at
+//!   a time — see `demand_strict_turns` and `--strict`.
+//! * **`max_threads_in_wasm()`**, which must be 1 and is 5 or 6. Real, still
+//!   unfixed, and not what caused the corruption.
+//! * **Every heap growth, with the guest stack behind it.** This is what
+//!   cracked it: a healthy round stopped at `0xf10000` and a corrupt one grew
+//!   three more times, the last inside `generate_raw_e2e_keys`. The heap size
+//!   was not correlated with the failure, it *decided* it —
+//!   `HostState::write` refuses an out-of-bounds range, so the bogus write only
+//!   landed when `32 + destination` still fit inside memory.
+//! * **Host randomness**, counted through `hot_calls` rather than `calls_to`,
+//!   because the argument-carrying trace stops at 8192 entries and a round
+//!   makes fifty million host calls. Asked the wrong way, it answers "never
+//!   called" about the function that was destroying the heap.
 //!
-//!    That correction matters because the opposite was written down here for a
-//!    while, on the strength of `emscripten_stack_get_base` still answering
-//!    `0x24cf60`. That function is `global.get 8; end`. It reads a wasm
-//!    *global*, which lives in the store rather than in memory, so it answers
-//!    the same on a wiped module as on a healthy one. It was never evidence.
-//! 3. **Nothing the host does explains it.** Every host write of 64 KiB or more
-//!    is this example's own guard fills. The host's only source of
-//!    high-entropy bytes is `fill_random`, now recorded on every call with no
-//!    size filter, and a corrupt round makes **zero** of them.
-//! 4. **The mapping cannot have moved.** wasmtime's 64-bit default
-//!    `memory_reservation` is `1 << 32`, and a shared memory whose declared
-//!    maximum fits inside that is reserved once, at creation, with no
-//!    `extra_to_reserve_on_growth`. A 17 MB heap never approaches it. The
-//!    frozen base in `LongTermVMMemoryDefinition` is therefore correct, and the
-//!    `memory_may_move(false)` experiment "not helping" was it changing
-//!    nothing.
-//! 5. **Guest threads run concurrently, on one stack.** This is the finding
-//!    that reframes the rest. `max_threads_in_wasm()` — printed below — peaks
-//!    at **five or six**, in healthy rounds as well as corrupt ones, against
-//!    the 1 that `schedule.rs` is supposed to guarantee. And the stack pointer
-//!    is a per-instance global initialised from the module, so every one of
-//!    those threads starts at `0x24cf60`, the main thread's own region.
-//! 6. **The damage is progressive and starts after the growth.** The watch
-//!    (below) first sees it with memory at 82%, 79% or 67% zero bytes — so
-//!    something writes for a while rather than in one store — and the heap has
-//!    *already* reached the `0x10e0000` that distinguishes a corrupt round from
-//!    a healthy one's `0xf10000`. The size discriminator is upstream of the
-//!    overwrite.
-//! 7. **The result is settled, not racing.** Reading the whole image twice in
-//!    a row gives identical bytes.
-//! 8. **Most heap growth never reaches the host.** `emscripten_resize_heap`
-//!    accounts for the first 166 pages; the memory ends at 241 or 270. The rest
-//!    is the guest running `memory.grow` itself, in healthy rounds too.
+//! # Dead ends, so they are not re-walked
 //!
-//! # What has been tried and does not work
-//!
-//! Giving each worker its own stack is the obvious move from (5), and it makes
-//! things strictly worse — three times, by three routes. The guest's own 64 KiB
-//! traps `startVoipCall` four attempts of four; 4 MiB "changes nothing"; 1 MiB
-//! installed through the module's own exports (`malloc`,
-//! `emscripten_stack_set_limits`, `stackRestore`, argument order checked
-//! against the bytecode) gives **8 corrupt rounds of 8** against a baseline of
-//! about 1 in 4. Something the guest believes about where a thread's stack
-//! lives disagrees with what the host tells it, and that contradiction is the
-//! lead.
-//!
-//! Serialising properly is the other obvious move and is unusable: holding the
-//! turn across exactly the guest-execution window, acquired and released in the
-//! store's `call_hook`, left a two-minute round unfinished after ten. A worker
-//! blocked in `memory.atomic.wait32` holds the turn from inside wasm, where
-//! nothing can take it back.
-//!
-//! Also tried and reverted: pre-growing memory to 64 MiB, skipping
-//! `_emscripten_thread_exit` for a worker that trapped (three rounds of four
-//! corrupt, against one in four), and neutralising the thread-status profiler
-//! (saves two workers, changes nothing else).
-//!
-//! # What the oracle does about it
-//!
-//! `Runtime::memory_view_is_coherent` remembers a slice of static data and
-//! `engine_log` returns nothing when it no longer matches, rather than handing
-//! back hundreds of lines of noise as though the engine had written them. The
-//! `coherent` column below is that check and it tracks the outcome exactly.
-//! The line counts below come from reading the ring's bytes directly rather
-//! than through `engine_log`, deliberately: an instrument for this has to see
-//! the wreckage the refusal exists to hide.
-//!
-//! `Runtime::watch_memory` is the sharper tool — it compares a span on both
-//! directions of every host boundary and reports the thread and guest stack
-//! that first sees it change. Its attribution ("this thread wrote it") is only
-//! sound while one thread runs at a time, so while (5) holds, treat those lines
-//! as timing information and not as blame.
+//! * Per-worker stacks: 64 KiB traps `startVoipCall` four of four, 4 MiB
+//!   "changes nothing", 1 MiB gives 8 corrupt rounds of 8. Still unexplained,
+//!   now only a curiosity.
+//! * Strict turns: correct and unusable, even at a 25 ms timeout.
+//! * Pre-growing memory to 64 MiB; skipping `_emscripten_thread_exit` on a
+//!   trapped worker (three of four corrupt); neutralising the thread-status
+//!   profiler.
+//! * `emscripten_stack_get_base` as evidence that "the guest is fine". It is
+//!   `global.get 8; end` — a wasm global, which answers the same on a wiped
+//!   module as on a healthy one.
 //!
 //! ```sh
 //! cargo run --release --example ring_corruption -- [rounds]
@@ -404,19 +372,64 @@ fn round(bytes: &[u8], index: usize) -> bool {
         runtime.max_threads_in_wasm()
     );
 
-    // The host's only source of high-entropy bytes, totalled rather than
-    // filtered by size.
-    let random = runtime.state().calls_to("env::fill_random");
-    let bytes: i64 = random.iter().filter_map(|call| call.args.get(1)).sum();
-    let lowest = random
-        .iter()
-        .filter_map(|call| call.args.first().copied())
-        .min()
+    // The host's only source of high-entropy bytes.
+    //
+    // Counted through `hot_calls` rather than `calls_to`, because the
+    // argument-carrying trace stops at 8192 entries and a round makes tens of
+    // millions of host calls — so `calls_to` answered "never called" for a
+    // function that was called, which is exactly the kind of confident silence
+    // this file exists to distrust.
+    let randomness = runtime
+        .state()
+        .hot_calls()
+        .into_iter()
+        .find(|(name, _)| name == "env::fill_random")
+        .map(|(_, count)| count)
         .unwrap_or(0);
+    let sample: Vec<String> = runtime
+        .state()
+        .calls_to("env::fill_random")
+        .iter()
+        .take(3)
+        .map(|call| format!("{:#x}+{}", call.args[0], call.args[1]))
+        .collect();
     println!(
-        "     host randomness: {} calls, {bytes} bytes total, lowest destination {lowest:#x}",
-        random.len()
+        "     host randomness: {randomness} calls{}",
+        if sample.is_empty() {
+            String::new()
+        } else {
+            format!(", first destinations {}", sample.join(", "))
+        }
     );
+
+    // The heap-size discriminator is exact and lands *before* the damage, so
+    // whatever takes the divergent path is visible in what the host was asked
+    // to do. Both sides are printed so a healthy round is the control.
+    let logs = runtime.logs();
+    let started: Vec<&String> = logs
+        .iter()
+        .filter(|line| line.contains("entering routine"))
+        .collect();
+    println!(
+        "     threads that entered a routine: {} | host calls {} | dropped log lines {}",
+        started.len(),
+        runtime.state().total_calls(),
+        runtime.state().shared.dropped_logs(),
+    );
+    let mut hot = runtime.state().hot_calls();
+    hot.truncate(6);
+    println!(
+        "     hottest host calls: {}",
+        hot.iter()
+            .map(|(name, count)| format!("{name}×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    println!("     memory growth, in order:");
+    for line in runtime.growths() {
+        println!("       {line}");
+    }
 
     if watching {
         let sightings = runtime.watch_report();

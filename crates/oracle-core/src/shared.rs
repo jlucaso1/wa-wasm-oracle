@@ -131,6 +131,17 @@ pub struct SharedHost {
     pub exports: std::sync::OnceLock<std::collections::BTreeSet<String>>,
     /// A span of guest memory that must never change. See `MemoryWatch`.
     pub watch: std::sync::OnceLock<MemoryWatch>,
+    /// Guest memory size the last time anyone looked, so growth can be noticed.
+    last_size: AtomicUsize,
+    /// Every growth seen, with the guest stack that was running.
+    ///
+    /// The heap ends at exactly `0x10e0000` on a corrupt round and `0xf10000`
+    /// on a healthy one — two values, not a distribution — and the growth
+    /// happens *before* the memory is destroyed. So one allocation takes a
+    /// different path, and this is what names it: most growth never reaches
+    /// `emscripten_resize_heap`, the guest running `memory.grow` itself, but
+    /// every crossing of the host boundary can still see the size change.
+    growths: Mutex<Vec<String>>,
     /// How many threads are inside guest code right now.
     in_wasm: AtomicUsize,
     /// The most that has ever been, which is the number that matters.
@@ -198,6 +209,8 @@ impl Default for SharedHost {
             table_export: std::sync::OnceLock::new(),
             exports: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
+            last_size: AtomicUsize::new(0),
+            growths: Mutex::new(Vec::new()),
             in_wasm: AtomicUsize::new(0),
             max_in_wasm: AtomicUsize::new(0),
             mailboxes: Mutex::new(std::collections::BTreeSet::new()),
@@ -279,6 +292,36 @@ impl SharedHost {
 
     pub fn strict_turns(&self) -> bool {
         self.scheduler.is_strict()
+    }
+
+    /// Notes the current guest memory size, returning the previous one when it
+    /// has changed.
+    ///
+    /// A single atomic swap in the common case, which matters: this runs on
+    /// every crossing of the host boundary and a guest worker makes tens of
+    /// millions of them.
+    pub fn note_memory_size(&self, size: usize) -> Option<usize> {
+        let previous = self.last_size.swap(size, Ordering::SeqCst);
+        (previous != size && previous != 0).then_some(previous)
+    }
+
+    /// Records one growth, with whatever the guest was doing at the time.
+    pub fn record_growth(&self, line: String) {
+        /// Enough to see the whole sequence of a round; a corrupt round and a
+        /// healthy one diverge well before this.
+        const MAX: usize = 64;
+
+        let mut growths = self.growths.lock().unwrap_or_else(|e| e.into_inner());
+        if growths.len() < MAX {
+            growths.push(line);
+        }
+    }
+
+    pub fn growths(&self) -> Vec<String> {
+        self.growths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Records a thread entering guest code, and returns nothing.

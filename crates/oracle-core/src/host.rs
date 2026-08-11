@@ -147,6 +147,7 @@ pub fn install_memory_watch(store: &mut Store<HostState>) {
                 .set(if strict { intact } else { None });
         } else {
             context.data().shared.left_wasm();
+            note_growth(&mut context);
             if intact == Some(false) {
                 let entry = context.data().watch_intact_entering_wasm.get();
                 report_broken_watch(&mut context, entry == Some(true), entry.is_some());
@@ -157,6 +158,45 @@ pub fn install_memory_watch(store: &mut Store<HostState>) {
         }
         Ok(())
     });
+}
+
+/// Records a change in guest memory size, with the guest stack behind it.
+///
+/// Cheap enough for every crossing: one atomic swap unless the size actually
+/// moved. See `SharedHost::growths` for why the size is worth this much
+/// attention.
+fn note_growth(context: &mut wasmtime::StoreContextMut<'_, HostState>) {
+    let Some(size) = context
+        .data()
+        .memory
+        .as_ref()
+        .map(|memory| memory.data().len())
+    else {
+        return;
+    };
+    let Some(previous) = context.data().shared.note_memory_size(size) else {
+        return;
+    };
+
+    let thread = context.data().thread_id;
+    let frames: Vec<String> = wasmtime::WasmBacktrace::capture(&*context)
+        .frames()
+        .iter()
+        .map(|frame| match frame.func_name() {
+            Some(name) => format!("{name} (f{})", frame.func_index()),
+            None => format!("f{}", frame.func_index()),
+        })
+        .collect();
+
+    context.data().shared.record_growth(format!(
+        "{previous:#x} -> {size:#x} (+{:#x}) on thread {thread}: {}",
+        size - previous,
+        if frames.is_empty() {
+            "<no guest frames>".to_owned()
+        } else {
+            frames.join(" <- ")
+        }
+    ));
 }
 
 /// Names the moment a watched span of guest memory stopped holding what it did.

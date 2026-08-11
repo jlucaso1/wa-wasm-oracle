@@ -550,15 +550,16 @@ probes of the same input could disagree — which is exactly what stalled the
 offer investigation. `engine_log_overflowed()` reports when the ring has wrapped,
 because past that point an index from an earlier read no longer means anything.
 
-**And it refuses when it cannot be trusted.** About one run in four, a specific
-call sequence leaves the host reading different memory from the guest — every
-byte of it, while the guest keeps executing correctly. The ring then reads as
-hundreds of lines of high-entropy noise. `memory_view_is_coherent()` re-reads a
-slice of the module's own static data, sampled once its constructors placed it,
-and `engine_log()` returns nothing when that slice no longer matches. The
-underlying fault is open — see "Nothing writes key-shaped bytes over a live
-allocation" in `VOIP_STATUS.md` — but an oracle that answers from the wrong
-memory is worse than one that declines to answer.
+**And it refuses when it cannot be trusted.** `memory_view_is_coherent()`
+re-reads a slice of the module's own static data, sampled once its constructors
+placed it, and `engine_log()` returns nothing when that slice no longer matches.
+It was written for a fault that destroyed the whole of linear memory about one
+run in four — the host reading `env::get_random_bytes_js` as `(buf, len)` when
+the module calls it `(len, buf)`, turning a 32-byte key request into fifteen
+megabytes of PRNG written from address 32. That is fixed (see "The host was
+writing the key material itself" in `VOIP_STATUS.md`); the refusal stays,
+because an oracle that answers from the wrong memory is worse than one that
+declines to answer.
 
 **Execution caches.** Compiled modules are cached on disk by wasmtime, keyed on
 their bytes and the compiler settings. The captured modules never change, so

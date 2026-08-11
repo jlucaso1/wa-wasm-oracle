@@ -1053,6 +1053,11 @@ impl Runtime {
         self.state().shared.demand_strict_turns();
     }
 
+    /// Every guest memory growth seen, with the guest stack behind it.
+    pub fn growths(&self) -> Vec<String> {
+        self.state().shared.growths()
+    }
+
     /// The most guest threads that have executed at once during this run.
     ///
     /// Must be 1. See `SharedHost::max_in_wasm`.
