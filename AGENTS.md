@@ -178,15 +178,21 @@ so it works on captures that do not exist yet. The order that has paid off:
    stack works, and is still not the fix" — so it predates every explanation
    offered for it so far.
 
-   The other symptom is readable rather than fatal, which makes it the better
-   place to start. About one run in four,
+   The other symptom is readable rather than fatal, and it is not what it
+   looked like. About one run in four,
    `settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` finds the
-   engine's log ring full of high-entropy bytes — `"E'8da(R#"`, `"8+bb=BX+"` —
-   with the ring *not* overflowed. That ring is a plain `malloc` handed to
-   `initLogRingBuffer`, so something wrote what looks like key material over a
-   live allocation, and the host can read the wreckage instead of trapping on
-   it. The test is a guard, not a defect: it is red when the corruption
-   happens, which is the only reason this is known at all.
+   engine's log ring full of high-entropy bytes with the ring not overflowed.
+   `examples/ring_corruption.rs` measured it: it is not the ring, it is *all*
+   of linear memory — one changed span from `0xd` to the end, 83% zeroes down
+   to 3%, a 64 KiB guard block gone rather than moved, static string data
+   unreadable — while `emscripten_stack_get_base` still answers `0x24cf60`, so
+   the guest is executing correctly throughout. Host writes, the host's entropy
+   source, a moved mapping and memory growth are each excluded by measurement;
+   see "Nothing writes key-shaped bytes over a live allocation" in
+   `VOIP_STATUS.md`. Note while you are there that wasmtime freezes a shared
+   memory's base at creation, so the host cannot detect a move even if one
+   happened. The test is a guard, not a defect: it is red when this happens,
+   which is the only reason any of it is known.
 3. **Drive a full call flow**: `initVoipStack` then
    `handleIncomingSignalingOffer`, and compare the recorded
    `sendSignalingXMPP_js_sync` payloads against what whatsapp-rust emits. The

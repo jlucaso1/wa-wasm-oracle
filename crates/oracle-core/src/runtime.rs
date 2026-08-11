@@ -900,6 +900,32 @@ impl Runtime {
     /// index into it from an earlier read points somewhere else. Callers that
     /// diff two reads have to treat it as "this comparison is invalid" rather
     /// than as a gap.
+    /// Where the engine's log ring is, and how big: `(base, bytes)`.
+    ///
+    /// The host allocated it, so the host can say where it is — which is what
+    /// makes the ring usable as a *witness*. It sits in the guest heap like any
+    /// other allocation, so anything that writes over live memory near it
+    /// leaves its damage at an address and a length already known here, rather
+    /// than somewhere that only surfaces when `free` refuses the result.
+    /// The host-side address the guest's memory currently starts at.
+    ///
+    /// Diagnostic only, and it exists because "the guest corrupted itself" and
+    /// "the host is looking somewhere else" are indistinguishable from the
+    /// contents alone. If this changes between two reads, every pointer the
+    /// host has cached — and every base a guest thread's instance compiled in
+    /// — is talking about a different mapping.
+    pub fn memory_base(&self) -> Option<usize> {
+        self.store
+            .data()
+            .memory
+            .as_ref()
+            .map(|memory| memory.data().as_ptr() as usize)
+    }
+
+    pub fn log_ring(&self) -> Option<(u32, u32)> {
+        self.log_ring
+    }
+
     pub fn engine_log_overflowed(&mut self) -> bool {
         if self.log_ring.is_none() {
             return false;

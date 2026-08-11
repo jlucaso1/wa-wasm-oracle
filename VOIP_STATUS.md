@@ -1163,7 +1163,47 @@ wasm has no guard page, and the engine's own frames are not small —
 `start_call_md` alone takes 4,176 bytes plus a 3,856-byte `memory.fill`. It is
 the first thing to account for before re-trying this.
 
-### Something writes key-shaped bytes over a live allocation
+### Nothing writes key-shaped bytes over a live allocation
+
+That was the reading, and `examples/ring_corruption.rs` was written to chase it
+by watching the ring's base and length — both of which the host knows — across
+the sequence that breaks it. It found something else.
+
+**The whole of linear memory changes, not the ring.** A healthy round differs in
+about 372 KB across ~539 spans, which is heap and stack churn. A bad one differs
+in a *single span from `0xd` to the last byte*. Zero bytes fall from 83% of the
+image to 3%. A 64 KiB guard block of `0xA5` allocated either side of the ring is
+absent afterwards — not relocated, absent. A string literal in static data,
+written once at instantiation and never again, reads as noise.
+
+**And the guest is fine while that is true.** `emscripten_stack_get_base` still
+answers `0x24cf60` at that moment. It reads a global and needs none of the
+host's argument marshalling, which is exactly why it is the question to ask: it
+separates "the guest destroyed itself" from "the host is looking somewhere
+else", and it says the second.
+
+Four mechanisms are ruled out, each by measurement:
+
+| candidate | how it was excluded |
+| --- | --- |
+| a host call wrote it | instrumenting every host write ≥ 64 KiB finds only the probe's own guards |
+| the host's entropy source wrote it | `getentropy`/`get_random_bytes_js` is never called below the heap or in chunks over 4 KiB |
+| the mapping moved | `SharedMemory::data()` reports the same base before and after — but see below |
+| memory growth triggered it | pre-growing to a fixed 64 MiB at creation, so the guest never calls `grow`, does not stop it |
+
+The third of those is weaker than it looks and the note matters more than the
+result: wasmtime freezes a shared memory's `base` in its `VMMemoryDefinition`
+when the memory is created, and `grow` updates only `current_length`. So
+`SharedMemory::data()` *cannot* observe a move, and the host has no way to ask.
+Whatever else is true, that is a hazard this harness is exposed to and cannot
+currently detect.
+
+What remains is that the host and the guest are reading different memory, with
+every mechanism that would explain how excluded above. `settings_from_an_
+incoming_offer_do_not_unblock_an_outgoing_call` is the test that catches it, at
+about one run in four, and it stays red when it does.
+
+### What this replaces: something writes key-shaped bytes over a live allocation
 
 The `free`-refusing-a-pointer trap has a second symptom, and this one can be
 read rather than only crashed into. About one run in four,
