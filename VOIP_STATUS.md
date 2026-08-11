@@ -1198,6 +1198,20 @@ when the memory is created, and `grow` updates only `current_length`. So
 Whatever else is true, that is a hazard this harness is exposed to and cannot
 currently detect.
 
+**One correlation survives, and it is exact.** A healthy round ends with four
+guest worker threads live; a corrupt one ends with one. Every round observed so
+far falls on one side or the other with nothing in between, so three workers
+trapping mid-call and the host's whole image of memory going wrong are not
+independent events.
+
+Which way the arrow points is now known, because the obvious intervention was
+tried. `threads.rs` runs `_emscripten_thread_exit` on a worker even when its
+routine trapped — teardown against whatever state the trap left, including a
+heap lock the guest may still believe is held. Skipping it for a trapped thread
+looks obviously safer. It is **three rounds of four corrupt**, against about one
+in four with it. So the teardown is load-bearing even after a trap, and worker
+death is upstream of the corruption rather than downstream of it.
+
 What remains is that the host and the guest are reading different memory, with
 every mechanism that would explain how excluded above. `settings_from_an_
 incoming_offer_do_not_unblock_an_outgoing_call` is the test that catches it, at

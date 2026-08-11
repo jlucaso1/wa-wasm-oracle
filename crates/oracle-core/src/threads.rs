@@ -344,6 +344,16 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
         },
     );
 
+    // The guest's teardown runs even when the routine trapped, and that is
+    // deliberate — it was tried the other way.
+    //
+    // `_emscripten_thread_exit` frees this thread's stack and TLS through the
+    // guest allocator and unlinks it from the pthread list, so running it after
+    // a trap means running it against whatever state the trap left. Skipping it
+    // in that case looks obviously safer and is measurably worse: three rounds
+    // of four corrupt in `examples/ring_corruption.rs`, against about one in
+    // four with it. A pthread left linked is something the surviving workers
+    // trip over, and worker deaths are what the corruption tracks.
     if let Some(exit) = instance.get_func(&mut store, "_emscripten_thread_exit") {
         let _ = exit.call(&mut store, &[Val::I32(0)], &mut []);
     }

@@ -32,12 +32,21 @@
 //! 6. **Growth is not the trigger.** Pre-growing the memory to a fixed 64 MiB
 //!    at creation, so the guest never calls `grow`, does not stop it — it
 //!    happened in two rounds of three.
+//! 7. **It coincides with guest worker threads dying.** A healthy round ends
+//!    with four of them live; a bad one with one. That is the strongest lead
+//!    left, and it is what this example prints first on every line.
 //!
 //! Together those say the host and the guest are looking at different memory,
 //! while every mechanism that could explain how is ruled out above. That is
 //! where this stops, and it is a long way from "something wrote key material
 //! over the ring", which is what the evidence looked like before any of it was
 //! measured.
+//!
+//! Whoever picks this up: start from (7), and know that the obvious move there
+//! has been tried. Not running `_emscripten_thread_exit` on a worker that
+//! trapped — teardown against broken state, which looks unsafe — makes it three
+//! rounds of four instead of one in four. Worker death is upstream of the
+//! corruption, and the guest's own teardown is load-bearing even after a trap.
 //!
 //! ```sh
 //! cargo run --release --example ring_corruption -- [rounds]
@@ -201,8 +210,8 @@ fn damage(before: &Snapshot, after: &Snapshot) -> Option<(usize, usize, usize)> 
     Some((first, last, clobbered))
 }
 
-fn engine(bytes: &[u8]) -> Option<(Runtime, u32, u32)> {
-    for _ in 0..6 {
+fn engine(bytes: &[u8]) -> Option<(Runtime, u32, u32, usize)> {
+    for attempt in 1..=6 {
         let mut runtime = Runtime::instantiate(bytes).expect("instantiate");
         runtime.set_thread_policy(ThreadPolicy::Spawn);
         runtime.run_ctors().expect("ctors");
@@ -237,14 +246,14 @@ fn engine(bytes: &[u8]) -> Option<(Runtime, u32, u32)> {
         runtime.refuel();
         if init.as_ref().ok().and_then(|value| value.as_int()) == Some(0) {
             runtime.settle(std::time::Duration::from_secs(2));
-            return Some((runtime, low, high));
+            return Some((runtime, low, high, attempt));
         }
     }
     None
 }
 
 fn round(bytes: &[u8], index: usize) -> bool {
-    let Some((mut runtime, low, high)) = engine(bytes) else {
+    let Some((mut runtime, low, high, attempts)) = engine(bytes) else {
         println!("{index:>3}: engine did not come up");
         return true;
     };
@@ -311,8 +320,10 @@ fn round(bytes: &[u8], index: usize) -> bool {
     let healthy = after_structured > 0;
 
     println!(
-        "{index:>3}: ring {base:#x}+{size:#x} | memory {:#x} -> {:#x} | before {before_lines} \
+        "{index:>3}: {attempts} attempt(s) | live threads {} | ring {base:#x}+{size:#x} | \
+         memory {:#x} -> {:#x} | before {before_lines} \
          lines/{before_structured} structured | after {after_lines}/{after_structured} | {}",
+        runtime.live_threads(),
         before.memory.len(),
         after.memory.len(),
         if healthy { "ok" } else { "CORRUPT" }
