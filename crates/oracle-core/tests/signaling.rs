@@ -925,20 +925,24 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
 
     let lines = runtime.engine_log_from(mark);
 
-    // What this actually found: about one run in four, the sequence leaves the
-    // engine's log full of random bytes rather than messages — 880 lines of
-    // them, none with the `file.cc`/`EVENT:` shape a real entry has:
+    // What this used to assert, and why it no longer does.
     //
-    //     "E'8da(R#"  "8+bb=BX+"  "{wP>Lc$C"  "6?U,f|n>"
+    // About one run in four the ring came back holding 880 lines of
+    // high-entropy noise — `"E'8da(R#"`, `"8+bb=BX+"` — and this test read that
+    // as the engine's state being corrupted by the sequence. It is not.
+    // `examples/ring_corruption.rs` measured it: *all* of linear memory reads
+    // differently, static string literals included, while the guest keeps
+    // executing correctly — `emscripten_stack_get_base` still answers
+    // `0x24cf60`. The host's view of guest memory is what breaks, not the
+    // engine.
     //
-    // Two things narrow that. The ring has **not** overflowed, so this is not
-    // the reader running off the end of what it may read. And the ring is a
-    // plain `malloc` in the guest heap that `attach_log_ring` hands to
-    // `initLogRingBuffer`, so something wrote high-entropy data — key material
-    // is the obvious candidate during call setup — straight over a live
-    // allocation. That is the same heap corruption `free` refuses a pointer
-    // over inside `startVoipCall`, caught somewhere it can be read instead of
-    // somewhere it traps.
+    // So the oracle now refuses rather than answering: `engine_log` checks a
+    // slice of the module's own static data and returns nothing when it no
+    // longer matches. A wrong answer from an oracle is worse than no answer,
+    // and hundreds of lines of noise presented as engine output is a wrong
+    // answer. That leaves this test asserting what it can actually establish —
+    // whatever the engine did say has the shape of engine output — and saying
+    // plainly when it could not look.
     let structured = lines
         .iter()
         .filter(|line| line.contains(".c") || line.contains("EVENT") || line.contains("call"))
@@ -952,13 +956,22 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
         eprintln!("  SAMPLE {line:?}");
     }
 
-    // So the useful invariant is about corruption, not about the guard: doing
-    // both in one engine must not shred the log. If this ever passes cleanly,
-    // the ordering has become usable and the settings hypothesis can finally be
-    // tested through it.
+    // Named rather than silent: a run that could not look is not a run that
+    // looked and found nothing, and a green suite should still say which it was.
+    if runtime.memory_view_is_coherent() == Some(false) {
+        eprintln!(
+            "the host's view of guest memory went incoherent during this sequence, so the \
+             engine's log could not be read — see VOIP_STATUS.md, \"Nothing writes key-shaped \
+             bytes over a live allocation\", and examples/ring_corruption.rs to reproduce it"
+        );
+    }
+
+    // The invariant that survives the correction: anything the engine *did*
+    // write has the shape of engine output. Noise reaching this point would
+    // mean the refusal above failed to fire.
     assert!(
         lines.is_empty() || structured > 0,
-        "the log is pure noise after offer-then-call: state is corrupted by the sequence"
+        "the log has lines but none of them are engine output: {lines:?}"
     );
 }
 

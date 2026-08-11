@@ -550,6 +550,16 @@ probes of the same input could disagree — which is exactly what stalled the
 offer investigation. `engine_log_overflowed()` reports when the ring has wrapped,
 because past that point an index from an earlier read no longer means anything.
 
+**And it refuses when it cannot be trusted.** About one run in four, a specific
+call sequence leaves the host reading different memory from the guest — every
+byte of it, while the guest keeps executing correctly. The ring then reads as
+hundreds of lines of high-entropy noise. `memory_view_is_coherent()` re-reads a
+slice of the module's own static data, sampled once its constructors placed it,
+and `engine_log()` returns nothing when that slice no longer matches. The
+underlying fault is open — see "Nothing writes key-shaped bytes over a live
+allocation" in `VOIP_STATUS.md` — but an oracle that answers from the wrong
+memory is worse than one that declines to answer.
+
 **Execution caches.** Compiled modules are cached on disk by wasmtime, keyed on
 their bytes and the compiler settings. The captured modules never change, so
 after the first run Cranelift is skipped entirely — which matters because the

@@ -8,7 +8,7 @@
 //! # What this establishes
 //!
 //! Each round brings an engine up, hands it an offer, snapshots *all* of linear
-//! memory, starts a call, and snapshots again. Six facts, each reproducible:
+//! memory, starts a call, and snapshots again. Ten facts, each reproducible:
 //!
 //! 1. **The whole memory changes, not the ring.** A healthy round differs in
 //!    ~372 KB across ~539 spans — heap and stack churn. A bad one differs in a
@@ -16,7 +16,8 @@
 //! 2. **What the host reads is not linear memory.** Zero bytes go from 83% of
 //!    the image to 3%. A 64 KiB guard block of `0xA5`, allocated either side of
 //!    the ring, is *absent* — not moved, absent. A string literal in static
-//!    data reads as noise, and static data is written once at instantiation.
+//!    data reads as noise, and static data is written once, by `memory.init`
+//!    from `__wasm_call_ctors`, and never again.
 //! 3. **The guest is fine.** `emscripten_stack_get_base` still returns
 //!    `0x24cf60` at that exact moment. It reads a global and needs none of the
 //!    host's marshalling, which is why it is the question worth asking.
@@ -56,6 +57,19 @@
 //! where this stops, and it is a long way from "something wrote key material
 //! over the ring", which is what the evidence looked like before any of it was
 //! measured.
+//!
+//! Fact (2) is also what the oracle now defends itself with. A slice of that
+//! static data is remembered when the constructors place it, and
+//! `Runtime::memory_view_is_coherent` re-reads it; `engine_log` returns nothing
+//! when it no longer matches, rather than handing back hundreds of lines of
+//! noise as though the engine had written them. The `coherent` column below is
+//! that check, and it agrees with the outcome exactly — `Some(false)` on every
+//! corrupt round, `Some(true)` on every healthy one. It does not fix anything:
+//! the host and the guest still end up reading different memory, and this
+//! example is still the way to reproduce that. Note that the line counts below
+//! come from reading the ring's bytes directly rather than through
+//! `engine_log`, deliberately: an instrument for this has to see the wreckage
+//! the refusal exists to hide, so a corrupt round still reports its 922 lines.
 //!
 //! Whoever picks this up: start from (7), and know that the obvious move there
 //! has been tried. Not running `_emscripten_thread_exit` on a worker that
@@ -340,10 +354,11 @@ fn round(bytes: &[u8], index: usize) -> bool {
     let healthy = after_structured > 0;
 
     println!(
-        "{index:>3}: {attempts} attempt(s) | live threads {} | stable {stable} | \
+        "{index:>3}: {attempts} attempt(s) | coherent {:?} | live threads {} | stable {stable} | \
          ring {base:#x}+{size:#x} | \
          memory {:#x} -> {:#x} | before {before_lines} \
          lines/{before_structured} structured | after {after_lines}/{after_structured} | {}",
+        runtime.memory_view_is_coherent(),
         runtime.live_threads(),
         before.memory.len(),
         after.memory.len(),

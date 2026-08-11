@@ -69,7 +69,48 @@ pub struct Runtime {
     pub unstubbable: Vec<String>,
     /// Address and size of the engine's log ring buffer, once attached.
     log_ring: Option<(u32, u32)>,
+    /// A slice of the module's own static data, and where it belongs.
+    ///
+    /// Written once when the module's constructors run and never again —
+    /// string literals and lookup tables live there — so it is a witness that
+    /// the host's view of guest memory still matches the guest's. See
+    /// `memory_view_is_coherent`.
+    canary: Option<(u32, Vec<u8>)>,
 }
+
+/// Chooses a slice of the module's static data to watch, out of live memory.
+///
+/// The first long run of printable ASCII above the reserved area is a string
+/// table: placed at startup and read forever after, so a difference in it is
+/// never the guest changing its mind.
+fn canary_at(runtime: &Runtime) -> Option<(u32, Vec<u8>)> {
+    /// Where to start looking. Below this is emscripten's reserved area and the
+    /// stack, neither of which is constant.
+    const FROM: u32 = 0x1_0000;
+    /// How far to look before giving up.
+    const WINDOW: u32 = 1 << 20;
+
+    // A run of printable ASCII this long is a string table, and a string table
+    // is written once and read forever.
+    //
+    // Read out of *memory* rather than out of the module's data segments,
+    // because a module built for shared memory has passive segments: they carry
+    // no static offset, so there is nothing to watch until `memory.init` has
+    // placed them. By this point it has.
+    let region = runtime.read(FROM, WINDOW).ok()?;
+    let printable = |byte: &u8| byte.is_ascii_graphic() || *byte == b' ';
+    let start = region
+        .windows(CANARY_BYTES)
+        .position(|window| window.iter().all(printable))?;
+    let at = FROM + u32::try_from(start).ok()?;
+    Some((at, region[start..start + CANARY_BYTES].to_vec()))
+}
+
+/// How much static data to remember as the witness.
+///
+/// Small on purpose. The failure this exists for replaces the whole of memory,
+/// so a larger sample would cost more and prove nothing extra.
+const CANARY_BYTES: usize = 256;
 
 /// The name a module exports its memory under.
 ///
@@ -171,6 +212,7 @@ impl Runtime {
             instance,
             unstubbable,
             log_ring: None,
+            canary: None,
         };
         runtime.sync_memory();
         Ok(runtime)
@@ -315,6 +357,18 @@ impl Runtime {
         }
 
         if ran {
+            // Take the coherence witness here rather than at instantiation.
+            //
+            // This module carries **passive** data segments, as any
+            // shared-memory build does: they name no static offset, and
+            // `memory.init` places them from `__wasm_init_memory`, which
+            // wasm-ld calls at the top of `__wasm_call_ctors` when there is no
+            // start section. So at instantiation linear memory is still zeroed
+            // and there is no static data to watch — sampling there returned
+            // `None` on every run and left `memory_view_is_coherent` unable to
+            // answer, which is the quiet way for this guard to be absent
+            // rather than wrong.
+            self.canary = canary_at(self);
             Ok(())
         } else {
             Err(anyhow!("module exports no constructor entry point"))
@@ -878,6 +932,17 @@ impl Runtime {
         let Some((buffer, size)) = self.log_ring else {
             return Vec::new();
         };
+        // Nothing rather than noise. When the host's view has gone wrong this
+        // buffer reads as hundreds of high-entropy lines, and a caller that
+        // takes them for engine output concludes something about a run that
+        // never happened.
+        if self.memory_view_is_coherent() == Some(false) {
+            self.state().log(
+                "engine log withheld: the host's view of guest memory no longer \
+                 matches the module's own static data",
+            );
+            return Vec::new();
+        }
         let Some(used) = self.ring_used(buffer, size) else {
             return Vec::new();
         };
@@ -920,6 +985,28 @@ impl Runtime {
             .memory
             .as_ref()
             .map(|memory| memory.data().as_ptr() as usize)
+    }
+
+    /// Whether the host's view of guest memory still matches the guest's.
+    ///
+    /// **An oracle that answers from the wrong memory is worse than one that
+    /// refuses**, and this host can end up doing exactly that: about one run in
+    /// four, an incoming offer followed by an outgoing call leaves every byte
+    /// the host reads different from what the guest sees, while the guest keeps
+    /// executing correctly — `emscripten_stack_get_base` still answers
+    /// `0x24cf60`. `examples/ring_corruption.rs` measures it and
+    /// `VOIP_STATUS.md` records what is and is not known about why.
+    ///
+    /// The check is a slice of the module's own static data, sampled once its
+    /// constructors have placed it. Nothing writes over a string literal, so a
+    /// difference here is not the guest changing its mind.
+    ///
+    /// `None` means there was no static data to watch — a fact about the
+    /// module, not an answer about this run.
+    pub fn memory_view_is_coherent(&self) -> Option<bool> {
+        let (at, expected) = self.canary.as_ref()?;
+        let len = u32::try_from(expected.len()).ok()?;
+        Some(self.read(*at, len).is_ok_and(|actual| actual == *expected))
     }
 
     pub fn log_ring(&self) -> Option<(u32, u32)> {

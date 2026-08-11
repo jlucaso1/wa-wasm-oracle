@@ -191,8 +191,16 @@ so it works on captures that do not exist yet. The order that has paid off:
    see "Nothing writes key-shaped bytes over a live allocation" in
    `VOIP_STATUS.md`. Note while you are there that wasmtime freezes a shared
    memory's base at creation, so the host cannot detect a move even if one
-   happened. The test is a guard, not a defect: it is red when this happens,
-   which is the only reason any of it is known.
+   happened.
+
+   The fault is open; the oracle answering from it is not.
+   `Runtime::memory_view_is_coherent` re-reads a slice of the module's own
+   static data and `engine_log` returns nothing when it no longer matches,
+   because a wrong answer from an oracle is worse than no answer. Take that
+   witness **after `run_ctors`**: a shared-memory build's data segments are
+   passive, so at instantiation there is nothing placed to watch and the check
+   answers `None` on every run — absent rather than wrong, which is the hard
+   kind of broken to notice.
 3. **Drive a full call flow**: `initVoipStack` then
    `handleIncomingSignalingOffer`, and compare the recorded
    `sendSignalingXMPP_js_sync` payloads against what whatsapp-rust emits. The

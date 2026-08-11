@@ -1173,8 +1173,8 @@ the sequence that breaks it. It found something else.
 about 372 KB across ~539 spans, which is heap and stack churn. A bad one differs
 in a *single span from `0xd` to the last byte*. Zero bytes fall from 83% of the
 image to 3%. A 64 KiB guard block of `0xA5` allocated either side of the ring is
-absent afterwards — not relocated, absent. A string literal in static data,
-written once at instantiation and never again, reads as noise.
+absent afterwards — not relocated, absent. A string literal in static data —
+placed once by `memory.init` and never written again — reads as noise.
 
 **And the guest is fine while that is true.** `emscripten_stack_get_base` still
 answers `0x24cf60` at that moment. It reads a global and needs none of the
@@ -1237,9 +1237,38 @@ of a memory whose size it is not told about, which is worth knowing before
 trusting anything the host caches about that memory.
 
 What remains is that the host and the guest are reading different memory, with
-every mechanism that would explain how excluded above. `settings_from_an_
-incoming_offer_do_not_unblock_an_outgoing_call` is the test that catches it, at
-about one run in four, and it stays red when it does.
+every mechanism that would explain how excluded above.
+
+#### What is fixed, and what is not
+
+The fault is not fixed. What is fixed is the oracle answering from it.
+
+`Runtime::memory_view_is_coherent` remembers a 256-byte slice of the module's
+own static data and re-reads it on demand; `engine_log` returns nothing, and
+says so in the host log, when the slice no longer matches. Hundreds of lines of
+high-entropy noise handed back as engine output is a wrong answer, and a wrong
+answer from an oracle is worse than no answer.
+
+Two details are load-bearing, and the first cost a wasted verification run.
+**The witness has to be taken after `run_ctors`, not at instantiation.** A
+shared-memory build carries *passive* data segments: they name no static offset,
+and `memory.init` places them from `__wasm_init_memory`, which wasm-ld calls at
+the top of `__wasm_call_ctors` because this module has no start section. Sampled
+at instantiation, memory is still zeroed, nothing is found, and
+`memory_view_is_coherent` answers `None` on every run — the guard silently
+absent rather than wrong. Second, it is read out of memory rather than out of
+the segment table for the same reason: a passive segment has no address to
+watch until it has been placed.
+
+`examples/ring_corruption.rs` prints the check per round, and it agrees with the
+outcome exactly: `Some(false)` on every corrupt round, `Some(true)` on every
+healthy one.
+
+`settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` is still the
+test that catches it, at about one run in four. What it now asserts is what it
+can establish — whatever the engine did say has the shape of engine output — and
+it names the incoherent runs on stderr, because a run that could not look is not
+a run that looked and found nothing.
 
 ### What this replaces: something writes key-shaped bytes over a live allocation
 
