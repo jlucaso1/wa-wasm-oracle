@@ -129,7 +129,59 @@ pub struct SharedHost {
     /// Kept so that a failed lookup can say what the module *does* have. See
     /// `exports.rs` for the bug that motivated it.
     pub exports: std::sync::OnceLock<std::collections::BTreeSet<String>>,
+    /// A span of guest memory that must never change. See `MemoryWatch`.
+    pub watch: std::sync::OnceLock<MemoryWatch>,
+    /// How many threads are inside guest code right now.
+    in_wasm: AtomicUsize,
+    /// The most that has ever been, which is the number that matters.
+    ///
+    /// It must be 1. `schedule.rs` exists to make it 1, every guest thread
+    /// starts from the same initial stack pointer — the stack pointer is a
+    /// per-instance global initialised from the module — and two threads
+    /// executing at once therefore push frames over each other's live frames.
+    /// Anything above 1 here is unbounded memory corruption, not a slowdown.
+    max_in_wasm: AtomicUsize,
 }
+
+/// A span of guest memory the host expects to stay constant, checked on entry
+/// to **every** host call.
+///
+/// Knowing that memory was destroyed some time during a call is most of a
+/// diagnosis short of the part that matters. This narrows it: host calls are
+/// frequent — a guest worker reaches one every few thousand instructions — so
+/// the first call that sees the span changed is close in time to whatever
+/// changed it, and it knows which thread it is on and what the guest was
+/// executing. See `Runtime::watch_memory`.
+#[derive(Debug)]
+pub struct MemoryWatch {
+    /// Where the span starts in linear memory.
+    pub at: u32,
+    /// What it held when the watch was set.
+    pub expected: Vec<u8>,
+    /// Set once anyone sees the span changed, so the example can say whether
+    /// the watch fired at all.
+    pub broken: std::sync::atomic::AtomicBool,
+    /// One sighting per thread, in the order they arrived.
+    ///
+    /// Per thread rather than once overall, because the first sighting names
+    /// the thread that *noticed* and that is rarely the one that wrote: the
+    /// first catch here was a media worker sitting in `pj_thread_sleep`. The
+    /// damage is progressive and the writer yields its turn while it runs, so
+    /// it enters host code too — a few sightings later.
+    ///
+    /// Held here rather than only in the host log, because the log *refuses*
+    /// new lines once full rather than evicting old ones, and a run that
+    /// corrupts its own memory is a chatty run. The report was being written at
+    /// line 8193 and discarded, which looked exactly like a watch that never
+    /// fired.
+    pub sightings: Mutex<Vec<(u64, String)>>,
+}
+
+/// How many threads to catch after the span changes.
+///
+/// Small: the engine runs a handful of workers, and once each has been seen
+/// once there is nothing further to learn from repeating them.
+pub const MAX_SIGHTINGS: usize = 8;
 
 impl Default for SharedHost {
     fn default() -> Self {
@@ -145,6 +197,9 @@ impl Default for SharedHost {
             invoke_imports: std::sync::OnceLock::new(),
             table_export: std::sync::OnceLock::new(),
             exports: std::sync::OnceLock::new(),
+            watch: std::sync::OnceLock::new(),
+            in_wasm: AtomicUsize::new(0),
+            max_in_wasm: AtomicUsize::new(0),
             mailboxes: Mutex::new(std::collections::BTreeSet::new()),
             stubbed: std::sync::OnceLock::new(),
             exit_code: Mutex::new(None),
@@ -215,6 +270,30 @@ impl SharedHost {
             return;
         }
         trace.logs.push(LogLine { seq, thread, text });
+    }
+
+    /// Records a thread entering guest code, and returns nothing.
+    pub fn entered_wasm(&self) {
+        let now = self.in_wasm.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_wasm.fetch_max(now, Ordering::SeqCst);
+    }
+
+    pub fn left_wasm(&self) {
+        // Saturating: a thread that traps out of guest code can leave without a
+        // matching entry, and an underflow here would read as a huge count.
+        let _ = self
+            .in_wasm
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
+                Some(now.saturating_sub(1))
+            });
+    }
+
+    /// The most guest threads that have ever been executing at once.
+    ///
+    /// See `max_in_wasm`: anything above 1 means threads were running over each
+    /// other's stack frames.
+    pub fn max_threads_in_wasm(&self) -> usize {
+        self.max_in_wasm.load(Ordering::SeqCst)
     }
 
     /// How many log lines were discarded because the buffer was full.

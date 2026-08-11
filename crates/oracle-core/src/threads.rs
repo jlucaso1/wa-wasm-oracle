@@ -190,6 +190,9 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     // this costs nothing during a run and makes shutdown independent of the
     // worker reaching a host call.
     store.set_epoch_deadline(1);
+    // Worker threads are where the interesting host calls happen, so a watch
+    // installed only on the main store would miss most of them.
+    crate::host::install_memory_watch(&mut store);
 
     let mut linker = build_linker(&mut store, &ctx.module)?;
     linker
@@ -255,27 +258,37 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
             .context("__emscripten_thread_init")?;
     }
 
-    // No `establishStackSpace` here, and the reason is a measurement rather
-    // than a belief about the offsets.
+    // No stack of its own for this thread, and that is now a measurement rather
+    // than an oversight — but read the measurement, because it says the
+    // opposite of what it should.
     //
-    // Emscripten's worker does run it, and this build needs someone to: the
-    // stack pointer is a *per-instance* global, `__emscripten_thread_init` sets
-    // the TLS globals and nothing else, and every worker therefore starts from
-    // the module's initial `0x24cf60` — the main thread's own 1 MiB region.
-    // Doing it here works exactly as documented, `+52`/`+56` hold, and each
-    // worker lands in its own 64 KiB region.
+    // The stack pointer is a *per-instance* wasm global, every instance is
+    // initialised from the same module, and `__emscripten_thread_init` sets the
+    // TLS globals and nothing else. So every guest thread starts at `0x24cf60`,
+    // the main thread's own region, and pushes its frames over whatever is live
+    // there. That would be survivable if threads took turns; they do not.
+    // `Runtime::max_threads_in_wasm()` peaks at **five or six** — see the note
+    // in AGENTS.md — so this is five call stacks sharing one address range,
+    // which is indefensible on its face.
     //
-    // It is still not an improvement. Under the full signaling setup it costs
-    // two tests: `startVoipCall` traps in a container destructor, four attempts
-    // out of four, and offer-then-call fills the log ring with noise. The trap
-    // is `free` refusing a corrupted pointer — the *same* one a minimal probe
-    // hits with the shared stack — so the heap corruption behind it is not the
-    // shared stack, and moving the stacks only moves which run trips it.
+    // Giving each thread its own stack nevertheless makes it strictly worse,
+    // three times now, by three different routes:
     //
-    // `examples/profiler_flag.rs` prints what a run does with either choice,
-    // and the numbers for both are in VOIP_STATUS.md. Do not re-try this
-    // without reading them; 64 KiB against the 1 MiB the workers borrow today
-    // is the first thing to account for.
+    // | stack per worker              | result                                |
+    // | ----------------------------- | ------------------------------------- |
+    // | shared (today)                | ~1 corrupt round in 4                 |
+    // | the guest's own 64 KiB        | `startVoipCall` traps 4 attempts of 4 |
+    // | 4 MiB, confirmed by stackSave | "changes nothing"                     |
+    // | 1 MiB from the guest heap     | **8 corrupt rounds of 8**             |
+    //
+    // The last row is this host installing the stack through the module's own
+    // exports — `malloc`, then `emscripten_stack_set_limits(base, end)`, then
+    // `stackRestore(top)` — with the argument order checked against the
+    // bytecode (`base` is global 8, `end` is global 7). It is the correct thing
+    // to do and it fails every time, so something the guest believes about
+    // where a thread's stack lives is not what this host is telling it.
+    // Whoever picks this up: that contradiction is the lead, not the shared
+    // stack itself.
 
     // The stack this thread ended up with, read through `stackSave` rather than
     // through an exported global. Global 0 *is* the stack pointer, but this

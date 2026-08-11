@@ -3,79 +3,95 @@
 //! About one run in four, an incoming offer followed by an outgoing call leaves
 //! the ring holding high-entropy bytes instead of messages — `"E'8da(R#"`,
 //! `"8+bb=BX+"` — with `getLogRingBufferOverflowCount` still zero. That was
-//! recorded as a write over a live allocation. It is not one.
+//! recorded as a write over a live allocation. It is not one, and it is not
+//! confined to the ring either.
 //!
 //! # What this establishes
 //!
 //! Each round brings an engine up, hands it an offer, snapshots *all* of linear
-//! memory, starts a call, and snapshots again. Ten facts, each reproducible:
+//! memory, starts a call, and snapshots again.
 //!
 //! 1. **The whole memory changes, not the ring.** A healthy round differs in
 //!    ~372 KB across ~539 spans — heap and stack churn. A bad one differs in a
-//!    single span covering every byte from `0xd` to the end.
-//! 2. **What the host reads is not linear memory.** Zero bytes go from 83% of
-//!    the image to 3%. A 64 KiB guard block of `0xA5`, allocated either side of
-//!    the ring, is *absent* — not moved, absent. A string literal in static
-//!    data reads as noise, and static data is written once, by `memory.init`
-//!    from `__wasm_call_ctors`, and never again.
-//! 3. **The guest is fine.** `emscripten_stack_get_base` still returns
-//!    `0x24cf60` at that exact moment. It reads a global and needs none of the
-//!    host's marshalling, which is why it is the question worth asking.
-//! 4. **No host call wrote it.** Instrumenting every host write of 64 KiB or
-//!    more finds only this example's own guard fills, and the host's only
-//!    entropy source — `getentropy` / `get_random_bytes_js` — is never called
-//!    outside the heap or in chunks over 4 KiB.
-//! 5. **The mapping did not move**, as far as wasmtime will say:
-//!    `SharedMemory::data()` reports the same base pointer before and after.
-//!    Note what that is worth — wasmtime freezes a shared memory's `base` when
-//!    the memory is created and `grow` updates only `current_length`, so this
-//!    check cannot see a move even in principle.
-//! 6. **Growth is not the trigger.** Pre-growing the memory to a fixed 64 MiB
-//!    at creation, so the guest never calls `grow`, does not stop it — it
-//!    happened in two rounds of three.
-//! 7. **It coincides with guest worker threads dying.** A healthy round ends
-//!    with four of them live; a bad one with fewer. Neutralising the
-//!    thread-status profiler saves two of them — a bad round then ends with
-//!    three — and does not stop the corruption.
-//! 8. **The discriminator is exact, and it is the heap.** Every round, in every
-//!    configuration tried: corrupt runs end with the guest heap at `0x10e0000`
-//!    and healthy ones at `0xf10000`. Not a distribution — two values, and
-//!    which one you get is which outcome you get. Something takes a different
-//!    path and allocates ~1.9 MB more.
-//! 9. **The result is settled, not racing.** Reading the whole image twice in
-//!    a row gives identical bytes, so none of this is a torn read.
-//! 10. **Most of the growth never reaches the host.** Logging every
-//!     `emscripten_resize_heap` call shows it accounting for only the first
-//!     166 pages; the memory ends at 241 or 270. The rest is the guest running
-//!     `memory.grow` itself, which the host is never told about — in healthy
-//!     rounds as well as corrupt ones, so it is not the discriminator, but it
-//!     does mean the host's view is maintained on an assumption that does not
-//!     hold.
+//!    single span from `0xd` to the end of the pre-call image. Zero bytes fall
+//!    from 83% to 3%, a 64 KiB guard block of `0xA5` either side of the ring is
+//!    *absent* rather than moved, and static string data reads as noise.
+//! 2. **The guest agrees.** Its own `malloc` traps, and so does
+//!    `getWebP2PVirtualIpv4`. Linear memory really is destroyed — this is not
+//!    the host reading the wrong place.
 //!
-//! Together those say the host and the guest are looking at different memory,
-//! while every mechanism that could explain how is ruled out above. That is
-//! where this stops, and it is a long way from "something wrote key material
-//! over the ring", which is what the evidence looked like before any of it was
-//! measured.
+//!    That correction matters because the opposite was written down here for a
+//!    while, on the strength of `emscripten_stack_get_base` still answering
+//!    `0x24cf60`. That function is `global.get 8; end`. It reads a wasm
+//!    *global*, which lives in the store rather than in memory, so it answers
+//!    the same on a wiped module as on a healthy one. It was never evidence.
+//! 3. **Nothing the host does explains it.** Every host write of 64 KiB or more
+//!    is this example's own guard fills. The host's only source of
+//!    high-entropy bytes is `fill_random`, now recorded on every call with no
+//!    size filter, and a corrupt round makes **zero** of them.
+//! 4. **The mapping cannot have moved.** wasmtime's 64-bit default
+//!    `memory_reservation` is `1 << 32`, and a shared memory whose declared
+//!    maximum fits inside that is reserved once, at creation, with no
+//!    `extra_to_reserve_on_growth`. A 17 MB heap never approaches it. The
+//!    frozen base in `LongTermVMMemoryDefinition` is therefore correct, and the
+//!    `memory_may_move(false)` experiment "not helping" was it changing
+//!    nothing.
+//! 5. **Guest threads run concurrently, on one stack.** This is the finding
+//!    that reframes the rest. `max_threads_in_wasm()` — printed below — peaks
+//!    at **five or six**, in healthy rounds as well as corrupt ones, against
+//!    the 1 that `schedule.rs` is supposed to guarantee. And the stack pointer
+//!    is a per-instance global initialised from the module, so every one of
+//!    those threads starts at `0x24cf60`, the main thread's own region.
+//! 6. **The damage is progressive and starts after the growth.** The watch
+//!    (below) first sees it with memory at 82%, 79% or 67% zero bytes — so
+//!    something writes for a while rather than in one store — and the heap has
+//!    *already* reached the `0x10e0000` that distinguishes a corrupt round from
+//!    a healthy one's `0xf10000`. The size discriminator is upstream of the
+//!    overwrite.
+//! 7. **The result is settled, not racing.** Reading the whole image twice in
+//!    a row gives identical bytes.
+//! 8. **Most heap growth never reaches the host.** `emscripten_resize_heap`
+//!    accounts for the first 166 pages; the memory ends at 241 or 270. The rest
+//!    is the guest running `memory.grow` itself, in healthy rounds too.
 //!
-//! Fact (2) is also what the oracle now defends itself with. A slice of that
-//! static data is remembered when the constructors place it, and
-//! `Runtime::memory_view_is_coherent` re-reads it; `engine_log` returns nothing
-//! when it no longer matches, rather than handing back hundreds of lines of
-//! noise as though the engine had written them. The `coherent` column below is
-//! that check, and it agrees with the outcome exactly — `Some(false)` on every
-//! corrupt round, `Some(true)` on every healthy one. It does not fix anything:
-//! the host and the guest still end up reading different memory, and this
-//! example is still the way to reproduce that. Note that the line counts below
-//! come from reading the ring's bytes directly rather than through
-//! `engine_log`, deliberately: an instrument for this has to see the wreckage
-//! the refusal exists to hide, so a corrupt round still reports its 922 lines.
+//! # What has been tried and does not work
 //!
-//! Whoever picks this up: start from (7), and know that the obvious move there
-//! has been tried. Not running `_emscripten_thread_exit` on a worker that
-//! trapped — teardown against broken state, which looks unsafe — makes it three
-//! rounds of four instead of one in four. Worker death is upstream of the
-//! corruption, and the guest's own teardown is load-bearing even after a trap.
+//! Giving each worker its own stack is the obvious move from (5), and it makes
+//! things strictly worse — three times, by three routes. The guest's own 64 KiB
+//! traps `startVoipCall` four attempts of four; 4 MiB "changes nothing"; 1 MiB
+//! installed through the module's own exports (`malloc`,
+//! `emscripten_stack_set_limits`, `stackRestore`, argument order checked
+//! against the bytecode) gives **8 corrupt rounds of 8** against a baseline of
+//! about 1 in 4. Something the guest believes about where a thread's stack
+//! lives disagrees with what the host tells it, and that contradiction is the
+//! lead.
+//!
+//! Serialising properly is the other obvious move and is unusable: holding the
+//! turn across exactly the guest-execution window, acquired and released in the
+//! store's `call_hook`, left a two-minute round unfinished after ten. A worker
+//! blocked in `memory.atomic.wait32` holds the turn from inside wasm, where
+//! nothing can take it back.
+//!
+//! Also tried and reverted: pre-growing memory to 64 MiB, skipping
+//! `_emscripten_thread_exit` for a worker that trapped (three rounds of four
+//! corrupt, against one in four), and neutralising the thread-status profiler
+//! (saves two workers, changes nothing else).
+//!
+//! # What the oracle does about it
+//!
+//! `Runtime::memory_view_is_coherent` remembers a slice of static data and
+//! `engine_log` returns nothing when it no longer matches, rather than handing
+//! back hundreds of lines of noise as though the engine had written them. The
+//! `coherent` column below is that check and it tracks the outcome exactly.
+//! The line counts below come from reading the ring's bytes directly rather
+//! than through `engine_log`, deliberately: an instrument for this has to see
+//! the wreckage the refusal exists to hide.
+//!
+//! `Runtime::watch_memory` is the sharper tool — it compares a span on both
+//! directions of every host boundary and reports the thread and guest stack
+//! that first sees it change. Its attribution ("this thread wrote it") is only
+//! sound while one thread runs at a time, so while (5) holds, treat those lines
+//! as timing information and not as blame.
 //!
 //! ```sh
 //! cargo run --release --example ring_corruption -- [rounds]
@@ -315,6 +331,11 @@ fn round(bytes: &[u8], index: usize) -> bool {
     let before = snapshot(&runtime, base, size);
     let (before_lines, before_structured) = before.structured();
 
+    // Arm the watch here rather than at startup: the offer path is healthy in
+    // every round observed, so anything it changed would only be noise ahead of
+    // the call that actually breaks.
+    let watching = runtime.watch_memory();
+
     let outcome = runtime.call_embind(
         "startVoipCall",
         &[
@@ -364,6 +385,39 @@ fn round(bytes: &[u8], index: usize) -> bool {
         after.memory.len(),
         if healthy { "ok" } else { "CORRUPT" }
     );
+
+    // Where the damage was *first seen*, which is the only line here that
+    // points at a cause rather than describing an aftermath.
+    println!(
+        "     most guest threads executing at once: {} (must be 1)",
+        runtime.max_threads_in_wasm()
+    );
+
+    // The host's only source of high-entropy bytes, totalled rather than
+    // filtered by size.
+    let random = runtime.state().calls_to("env::fill_random");
+    let bytes: i64 = random.iter().filter_map(|call| call.args.get(1)).sum();
+    let lowest = random
+        .iter()
+        .filter_map(|call| call.args.first().copied())
+        .min()
+        .unwrap_or(0);
+    println!(
+        "     host randomness: {} calls, {bytes} bytes total, lowest destination {lowest:#x}",
+        random.len()
+    );
+
+    if watching {
+        let sightings = runtime.watch_report();
+        if sightings.is_empty() && !healthy {
+            println!(
+                "     memory watch never fired, so no entry into host code saw the span changed"
+            );
+        }
+        for line in sightings {
+            println!("     {line}");
+        }
+    }
 
     // The control this instrument needs: a healthy round's diff. Without it,
     // "the whole memory changed" says nothing — it could be what every round

@@ -93,6 +93,10 @@ pub struct HostState {
     /// This thread's PRNG state. Per-thread on purpose — see
     /// `SharedHost::seed_for`.
     rng: std::cell::Cell<u64>,
+    /// Whether the watched span was intact the last time this thread entered
+    /// guest code. See `host::install_memory_watch` — this is what turns "the
+    /// span broke" into "this thread broke it".
+    pub watch_intact_entering_wasm: std::cell::Cell<bool>,
     /// Values handed to the guest as `emscripten::val` handles. See `emval.rs`.
     pub emval: crate::emval::EmvalTable,
 }
@@ -165,6 +169,7 @@ impl HostState {
             threads,
             memory_export: None,
             rng: std::cell::Cell::new(SharedHost::seed_for(thread_id)),
+            watch_intact_entering_wasm: std::cell::Cell::new(true),
             emval: crate::emval::EmvalTable::default(),
         }
     }
@@ -257,6 +262,36 @@ impl HostState {
         Ok(unsafe {
             std::slice::from_raw_parts((base + start) as *const u8, len as usize).to_vec()
         })
+    }
+
+    /// Whether the watched span still holds what it did.
+    ///
+    /// `None` means there is nothing to answer about — no watch is set, or this
+    /// module's memory is not readable this way. Deliberately allocation-free:
+    /// this runs on *both* directions of every host-code boundary, and a guest
+    /// worker crosses millions of them, so a `Vec` per crossing would be the
+    /// most expensive thing in the run.
+    ///
+    /// Keeps answering after the span has broken, rather than latching. The
+    /// attribution in `install_memory_watch` needs the answer on the way into
+    /// guest code as well as on the way out, and a latched check can only ever
+    /// say that something happened, never which thread did it.
+    #[allow(unsafe_code)]
+    pub fn watch_intact(&self) -> Option<bool> {
+        let watch = self.shared.watch.get()?;
+        let memory = self.memory.as_ref()?;
+        let start = watch.at as usize;
+        let span = memory
+            .data()
+            .get(start..start.checked_add(watch.expected.len())?)?;
+        // SAFETY: the same argument as `read` — per-byte through the cell, so
+        // no reference into shared memory is formed, and the range came from
+        // `get` rather than from arithmetic.
+        Some(
+            span.iter()
+                .zip(&watch.expected)
+                .all(|(cell, byte)| unsafe { *cell.get() } == *byte),
+        )
     }
 
     /// Reads a NUL-terminated C string.

@@ -703,6 +703,15 @@ fn answer_em_asm(snippet: &str) -> i32 {
 
 /// Fills guest memory with bytes from the deterministic PRNG.
 fn fill_random(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> Result<()> {
+    // Recorded, because this is the host's only source of high-entropy bytes
+    // and the corruption in `examples/ring_corruption.rs` looks exactly like
+    // them. An earlier pass excluded this by instrumenting writes of 64 KiB or
+    // more — which says nothing about the same total arriving four kilobytes at
+    // a time.
+    caller
+        .data()
+        .record("env", "fill_random", vec![ptr as i64, len as i64]);
+
     let mut bytes = Vec::with_capacity(len as usize);
     {
         let state = caller.data();

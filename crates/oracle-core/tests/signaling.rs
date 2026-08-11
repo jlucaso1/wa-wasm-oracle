@@ -717,6 +717,75 @@ fn the_log_reader_returns_only_the_log() {
     }
 }
 
+/// Guest threads are **not** serialised, and this pins that down.
+///
+/// `schedule.rs` is supposed to run one guest thread at a time, and several
+/// safety arguments in this codebase lean on it — `HostState::read`'s SAFETY
+/// note among them. It does not hold: a thread acquires the turn once around
+/// its whole routine, and `yield_point` hands it on only while some other
+/// thread is blocked in its own first `acquire`, so once every worker has
+/// forced past `TURN_TIMEOUT` nothing waits and nothing yields.
+///
+/// Asserted the way it actually is, rather than the way it should be, because a
+/// permanently red test teaches nobody anything and a silent one hides this
+/// entirely. **If this test starts failing, the scheduler has been fixed** —
+/// which is good news, and the thing to do is update it along with the notes in
+/// `AGENTS.md`, `threads.rs` and `examples/ring_corruption.rs` that all say
+/// otherwise.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn guest_threads_are_not_serialised() {
+    let _serial = threaded_guard();
+    let runtime = engine_or_skip!();
+
+    let peak = runtime.max_threads_in_wasm();
+    eprintln!("most guest threads executing at once: {peak}");
+    assert!(
+        peak > 1,
+        "the scheduler now serialises guest threads — see this test's docs, \
+         several comments claim the opposite and need updating"
+    );
+}
+
+/// The memory watch fires, and says which thread and which guest stack.
+///
+/// This exists because the watch's *silence* was briefly taken as evidence.
+/// The first version checked only inside `host_func`, and `emscripten.rs`
+/// defines most of its functions with `func_wrap`, so it stayed quiet through a
+/// round that destroyed ten megabytes of guest memory — reported as "nothing
+/// wrote to the watched span", meaning "nothing looked at it".
+///
+/// A watch that cannot be seen to fire is worth nothing, so this makes it fire:
+/// arm it, change the span, then let the engine's workers make host calls.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn the_memory_watch_names_the_moment() {
+    let _serial = threaded_guard();
+    let mut runtime = engine_or_skip!();
+
+    assert!(runtime.watch_memory(), "no static data to watch");
+    let (at, len) = runtime.coherence_witness().expect("witness");
+    runtime
+        .write_bytes_at(at, &vec![0xFF; len as usize])
+        .expect("clobber the watched span");
+
+    // The workers poll, so they reach a host call within milliseconds; this is
+    // waiting for the report rather than for anything to happen.
+    runtime.settle(Duration::from_secs(2));
+
+    // From the watch, not from the host log: the log refuses new lines once
+    // full, and this report was being written past that point and discarded.
+    let report = runtime
+        .watch_report()
+        .into_iter()
+        .next()
+        .expect("the watch never fired on a span that was definitely changed");
+    assert!(
+        report.contains("guest stack:"),
+        "the report must carry the guest stack, which is the whole point of it: {report}"
+    );
+}
+
 /// The log is withheld when the host's view of guest memory has gone wrong.
 ///
 /// About one run in four, an incoming offer followed by an outgoing call leaves

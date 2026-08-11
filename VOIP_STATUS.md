@@ -1176,11 +1176,33 @@ image to 3%. A 64 KiB guard block of `0xA5` allocated either side of the ring is
 absent afterwards — not relocated, absent. A string literal in static data —
 placed once by `memory.init` and never written again — reads as noise.
 
-**And the guest is fine while that is true.** `emscripten_stack_get_base` still
-answers `0x24cf60` at that moment. It reads a global and needs none of the
-host's argument marshalling, which is exactly why it is the question to ask: it
-separates "the guest destroyed itself" from "the host is looking somewhere
-else", and it says the second.
+**That last paragraph used to end "and the guest is fine while that is true",
+and it was wrong.** The evidence offered was that `emscripten_stack_get_base`
+still answers `0x24cf60` at that moment. Read the function:
+
+```
+emscripten_stack_get_base (function #593)
+  global.get 8
+  end
+```
+
+It returns a **wasm global**. Globals live in the store, not in linear memory,
+so that answer is exactly as correct on a module whose memory has been wiped as
+on a healthy one. It never was evidence about memory, and everything built on
+it — "the host is looking somewhere else", "the guest is executing correctly
+throughout" — was built on nothing.
+
+What the same instrument says when asked properly: **the guest's own `malloc`
+traps** in a corrupt round, and so does `getWebP2PVirtualIpv4`. The guest agrees
+with the host. Linear memory really is destroyed.
+
+The third row of the table below can go too, for a separate reason.
+`memory_may_move(false)` with a 4 GiB reservation "did not help" because it
+changed nothing: wasmtime's 64-bit default `memory_reservation` is **already**
+`1 << 32`, and `ty.maximum_byte_size() <= alloc_bytes` zeroes
+`extra_to_reserve_on_growth`, so the mapping is reserved once at 4 GiB and a
+17 MB heap never approaches it. The mapping cannot move, the frozen base is
+correct, and the host and guest are reading the same bytes.
 
 Four mechanisms are ruled out, each by measurement:
 
@@ -1236,8 +1258,69 @@ the guest executing `memory.grow` itself. The host therefore maintains its view
 of a memory whose size it is not told about, which is worth knowing before
 trusting anything the host caches about that memory.
 
-What remains is that the host and the guest are reading different memory, with
-every mechanism that would explain how excluded above.
+### What is actually wrong: guest threads run concurrently on one stack
+
+Measured, and it is the harness's own defect rather than the module's.
+
+**Up to six guest threads execute at the same time.** `examples/ring_corruption.rs`
+counts it: `SharedHost::entered_wasm`/`left_wasm` bracket every crossing of the
+host boundary in the store's `call_hook`, and `max_threads_in_wasm()` reports
+the peak. It must be 1. It is 5 or 6 in every round, healthy and corrupt alike.
+
+`schedule.rs` was supposed to prevent that and cannot, as written. A thread
+acquires the turn **once**, around its whole routine, and `yield_point` hands it
+on only while `waiting > 0` — that is, only while some other thread is blocked
+in its own first `acquire`. Once every worker has forced its way past
+`TURN_TIMEOUT`, nothing is ever waiting again, so nothing ever yields and every
+thread runs freely. The `func_wrap` gap makes it worse — a PJSIP worker sitting
+in `pj_thread_sleep` reaches `emscripten_get_now` and nothing else, and that
+import is defined with `Linker::func_wrap`, so it passes through neither
+`host_func` nor `yield_point`.
+
+**And every guest thread starts from the same stack pointer.** The stack pointer
+is a per-instance wasm global, every instance is initialised from the same
+module, and `__emscripten_thread_init` sets the TLS globals and nothing else. So
+each thread begins at `0x24cf60` — the main thread's own region — and pushes its
+frames over whatever is live there. Six call stacks, one address range.
+
+Two things follow, and only the first is settled:
+
+* The old measurements that "ruled out" the shared stack were taken while this
+  was true, so they ruled out nothing: the run they compared against was also
+  running several threads over each other.
+* Making the turn cover exactly the guest-execution window — `acquire` on the
+  way into wasm, `release` on the way out, both in the `call_hook` — does
+  serialise, and is **unusable**: a round that takes two minutes had not
+  finished one in ten. That is `TURN_TIMEOUT`'s reason for existing showing up
+  as latency instead of deadlock, because a worker blocked in
+  `memory.atomic.wait32` holds the turn from inside wasm where nothing can take
+  it back. Serialising and letting workers block are not both available.
+
+The consequence for the rest of this file: **concurrency here is not a bug to be
+scheduled away, it is the environment the module was built for**, and a browser
+gives each of those threads its own stack. This host did not.
+
+### What the watch establishes about the write itself
+
+`Runtime::watch_memory` compares a 64-byte span of static data on both
+directions of every host boundary. Three facts came out of it:
+
+* **The damage is progressive, not one wild store.** At the first sighting the
+  memory is 82%, 79% or 67% zero bytes depending on the round, against 83%
+  healthy and 3% at the end. Something writes for a while.
+* **Memory has already grown to its final corrupt size before the damage
+  starts.** The `0x10e0000`-versus-`0xf10000` discriminator is upstream of the
+  overwrite, not a consequence of it.
+* **The host's randomness is not the source.** The earlier pass excluded it by
+  instrumenting writes of 64 KiB or more, which says nothing about the same
+  total arriving in 4 KiB pieces. Counted properly — every `fill_random` call
+  recorded, no size filter — a corrupt round makes **zero** of them.
+
+Attribution is the one thing the watch cannot yet give. "The span was intact
+when this thread entered wasm and broken when it returned" is only sound while
+one thread runs at a time; with six, four threads report it at once and all four
+reports are worthless. Fixing the concurrency is a precondition for naming the
+writer, not an alternative to it.
 
 #### What is fixed, and what is not
 

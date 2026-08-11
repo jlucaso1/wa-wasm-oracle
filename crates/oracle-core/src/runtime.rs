@@ -168,6 +168,7 @@ impl Runtime {
         // the whole budget, and only `Runtime::drop` ever spends it.
         store.set_epoch_deadline(1);
         store.set_fuel(DEFAULT_FUEL).ok();
+        crate::host::install_memory_watch(&mut store);
 
         let mut linker = Linker::new(&engine);
         // Emscripten declares each import once, but a defensive allow keeps a
@@ -1007,6 +1008,52 @@ impl Runtime {
         let (at, expected) = self.canary.as_ref()?;
         let len = u32::try_from(expected.len()).ok()?;
         Some(self.read(*at, len).is_ok_and(|actual| actual == *expected))
+    }
+
+    /// Starts watching the module's static data for the moment it changes.
+    ///
+    /// The coherence check answers *whether* memory went wrong, which is enough
+    /// to refuse a bad answer and not enough to find the cause. This answers
+    /// *when*: the span is compared on entry to every host call, and the first
+    /// call to see it changed reports its thread and the guest stack it was
+    /// called from. See `report_broken_watch` in `host.rs`.
+    ///
+    /// Returns whether a watch was set — `false` when the module offered no
+    /// static data to watch, or when one is already running.
+    pub fn watch_memory(&mut self) -> bool {
+        /// Enough to be certain, short enough that comparing it on every host
+        /// call does not dominate the run.
+        const SPAN: usize = 64;
+
+        let Some((at, expected)) = self.canary.as_ref() else {
+            return false;
+        };
+        let watch = crate::shared::MemoryWatch {
+            at: *at,
+            expected: expected[..SPAN.min(expected.len())].to_vec(),
+            broken: std::sync::atomic::AtomicBool::new(false),
+            sightings: std::sync::Mutex::new(Vec::new()),
+        };
+        self.state().shared.watch.set(watch).is_ok()
+    }
+
+    /// The most guest threads that have executed at once during this run.
+    ///
+    /// Must be 1. See `SharedHost::max_in_wasm`.
+    pub fn max_threads_in_wasm(&self) -> usize {
+        self.state().shared.max_threads_in_wasm()
+    }
+
+    /// What the watch saw, one line per thread that saw it.
+    ///
+    /// Read from the watch rather than from the host log on purpose: see
+    /// `MemoryWatch::sightings`.
+    pub fn watch_report(&self) -> Vec<String> {
+        let Some(watch) = self.state().shared.watch.get() else {
+            return Vec::new();
+        };
+        let sightings = watch.sightings.lock().unwrap_or_else(|e| e.into_inner());
+        sightings.iter().map(|(_, line)| line.clone()).collect()
     }
 
     /// Where the coherence witness sits, and how long it is.

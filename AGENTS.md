@@ -79,6 +79,16 @@ different code. Treat a capture bump as a re-derivation, never as an update.
   a host call, so the turn is yielded and the proxying queue drains.
   `startup_is_reliable_and_never_forces_a_turn` is the guard; `forced_turns()`
   must stay zero.
+- **Guest threads are not serialised, whatever `schedule.rs` says.** Measured:
+  `Runtime::max_threads_in_wasm()` peaks at **five or six**, in every round,
+  healthy and corrupt alike. A thread acquires the turn once around its whole
+  routine and `yield_point` hands it on only while somebody is blocked in their
+  own first `acquire`, so once every worker has forced past `TURN_TIMEOUT`
+  nothing waits and nothing yields. Making the turn cover exactly the
+  guest-execution window does serialise and is unusable — a two-minute round
+  had not finished in ten. Do not write code whose safety argument is "the
+  scheduler holds all but one thread outside guest code"; that is not true
+  today. `HostState::read`'s SAFETY note is the one place still saying it.
 - **Every test that starts an engine takes both locks.** `threaded_guard()`
   serialises within a test binary; `common::engine_lock()` serialises *across*
   them, because cargo runs the binaries in parallel and `threading`,
