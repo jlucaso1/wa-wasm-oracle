@@ -131,16 +131,6 @@ pub struct SharedHost {
     pub exports: std::sync::OnceLock<std::collections::BTreeSet<String>>,
     /// A span of guest memory that must never change. See `MemoryWatch`.
     pub watch: std::sync::OnceLock<MemoryWatch>,
-    /// Whether guest threads must take strict turns from now on.
-    ///
-    /// Off during normal running, because serialising is correct and unusable:
-    /// a worker blocked in `memory.atomic.wait32` holds its turn from inside
-    /// wasm where nothing can take it back, and a two-minute round did not
-    /// finish in ten. An investigator switches it on around the one operation
-    /// under suspicion — see `Runtime::demand_strict_turns` — because the
-    /// memory watch's "this thread wrote it" only means anything while one
-    /// thread runs at a time.
-    strict_turns: std::sync::atomic::AtomicBool,
     /// How many threads are inside guest code right now.
     in_wasm: AtomicUsize,
     /// The most that has ever been, which is the number that matters.
@@ -208,7 +198,6 @@ impl Default for SharedHost {
             table_export: std::sync::OnceLock::new(),
             exports: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
-            strict_turns: std::sync::atomic::AtomicBool::new(false),
             in_wasm: AtomicUsize::new(0),
             max_in_wasm: AtomicUsize::new(0),
             mailboxes: Mutex::new(std::collections::BTreeSet::new()),
@@ -285,11 +274,11 @@ impl SharedHost {
 
     /// Turns on strict turn-taking. See `strict_turns`.
     pub fn demand_strict_turns(&self) {
-        self.strict_turns.store(true, Ordering::SeqCst);
+        self.scheduler.demand_strict();
     }
 
     pub fn strict_turns(&self) -> bool {
-        self.strict_turns.load(Ordering::SeqCst)
+        self.scheduler.is_strict()
     }
 
     /// Records a thread entering guest code, and returns nothing.

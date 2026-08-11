@@ -335,6 +335,17 @@ fn round(bytes: &[u8], index: usize) -> bool {
     // every round observed, so anything it changed would only be noise ahead of
     // the call that actually breaks.
     let watching = runtime.watch_memory();
+    // Strict turns for the call and nothing else. The watch's "this thread
+    // wrote it" is only sound while one thread runs at a time.
+    //
+    // Left in as a flag rather than made the default because it does not
+    // finish: even with the turn timeout at 25 ms, a round that normally takes
+    // two minutes had not completed in ten. Under strict turns every crossing
+    // of the host boundary takes the scheduler lock, and a worker polling the
+    // clock crosses it millions of times. Reach for it knowing that.
+    if std::env::args().any(|arg| arg == "--strict") {
+        runtime.demand_strict_turns();
+    }
 
     let outcome = runtime.call_embind(
         "startVoipCall",

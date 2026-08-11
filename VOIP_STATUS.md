@@ -1327,11 +1327,34 @@ and is not: attribution catches the transition from intact to broken, and by the
 time anything has noticed, the transition is over. Measured — with it on, a
 corrupt round produces ten sightings and every one of them says "already broken
 before this thread ran", correctly and uselessly. `Runtime::demand_strict_turns`
-is therefore something to switch on *before* the operation under suspicion, at
-the cost of the slowdown above, and that is the next experiment worth running:
-strict turns for the duration of `startVoipCall` alone, with `TURN_TIMEOUT` cut
-right down so that the degradation is graceful rather than a five-second stall
-per crossing.
+is therefore something to switch on *before* the operation under suspicion —
+`ring_corruption --strict` does exactly that, for the duration of
+`startVoipCall` and nothing else.
+
+That has been tried, including with the turn timeout cut from five seconds to
+25 ms so the degradation is graceful rather than a stall per crossing. **It
+still does not finish a round in ten minutes.** The reason is the crossing rate
+rather than the timeout: under strict turns every crossing of the host boundary
+takes the scheduler lock, and a guest worker polling the clock crosses it
+millions of times per round. Serialising this host is not affordable at any
+timeout, and an attribution scheme that needs it is not going to work either.
+
+What is left, in the order worth trying:
+
+1. **Narrow the window instead of the concurrency.** Watch a span, and when it
+   breaks, look at *what replaced it* rather than at who was running. Ten
+   megabytes of high-entropy bytes came from somewhere; if they are a copy of
+   another region, the shift names the instruction, and if they are not, that
+   rules out `memory.copy` and leaves a generator.
+2. **Ask why separate stacks make it worse**, which is the sharpest
+   contradiction on the table. Three independent attempts, three regressions,
+   and no theory that survives — something the guest believes about a thread's
+   stack disagrees with what this host tells it. `+52`/`+56` in the pthread and
+   the `emscripten_stack_*` globals are the two places that belief could live.
+3. **Check what the guest does with `__pthread_create_js` and
+   `__emscripten_thread_cleanup`**, the two thread-lifecycle imports this host
+   answers. Worker death is upstream of the corruption, and those are where a
+   worker's death is negotiated.
 
 #### What is fixed, and what is not
 
