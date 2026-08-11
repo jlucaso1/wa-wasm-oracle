@@ -43,6 +43,13 @@
 //!    path and allocates ~1.9 MB more.
 //! 9. **The result is settled, not racing.** Reading the whole image twice in
 //!    a row gives identical bytes, so none of this is a torn read.
+//! 10. **Most of the growth never reaches the host.** Logging every
+//!     `emscripten_resize_heap` call shows it accounting for only the first
+//!     166 pages; the memory ends at 241 or 270. The rest is the guest running
+//!     `memory.grow` itself, which the host is never told about — in healthy
+//!     rounds as well as corrupt ones, so it is not the discriminator, but it
+//!     does mean the host's view is maintained on an assumption that does not
+//!     hold.
 //!
 //! Together those say the host and the guest are looking at different memory,
 //! while every mechanism that could explain how is ruled out above. That is

@@ -1228,6 +1228,14 @@ of the workers — a corrupt round then ends with three live instead of one — 
 does not stop the corruption. So the profiler traps are a consequence, not the
 path.
 
+And one fact about this host that the search turned up on the way, true of every
+round rather than only the bad ones: **most of the heap growth never reaches
+`emscripten_resize_heap`**. Logging every call shows the host being asked for the
+first 166 pages and no more, while the memory ends at 241 or 270 — the rest is
+the guest executing `memory.grow` itself. The host therefore maintains its view
+of a memory whose size it is not told about, which is worth knowing before
+trusting anything the host caches about that memory.
+
 What remains is that the host and the guest are reading different memory, with
 every mechanism that would explain how excluded above. `settings_from_an_
 incoming_offer_do_not_unblock_an_outgoing_call` is the test that catches it, at
