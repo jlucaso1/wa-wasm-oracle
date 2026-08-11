@@ -1212,6 +1212,22 @@ looks obviously safer. It is **three rounds of four corrupt**, against about one
 in four with it. So the teardown is load-bearing even after a trap, and worker
 death is upstream of the corruption rather than downstream of it.
 
+Two further facts, both from the same instrument:
+
+* **The discriminator is exact, and it is the heap size.** Every round, under
+  every configuration tried: a corrupt run ends with the guest heap at
+  `0x10e0000` and a healthy one at `0xf10000`. Not a distribution — two values,
+  and which one you get is which outcome you get. Something takes a different
+  path and allocates about 1.9 MB more, and that is a better handle than the
+  thread count because it does not move when the profiler is patched out.
+* **The end state is settled.** Reading the whole image twice in a row returns
+  identical bytes, so nothing here is a torn read of memory still being written.
+
+Neutralising the thread-status profiler is worth knowing about too: it saves two
+of the workers — a corrupt round then ends with three live instead of one — and
+does not stop the corruption. So the profiler traps are a consequence, not the
+path.
+
 What remains is that the host and the guest are reading different memory, with
 every mechanism that would explain how excluded above. `settings_from_an_
 incoming_offer_do_not_unblock_an_outgoing_call` is the test that catches it, at

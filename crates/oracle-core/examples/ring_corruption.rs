@@ -33,8 +33,16 @@
 //!    at creation, so the guest never calls `grow`, does not stop it — it
 //!    happened in two rounds of three.
 //! 7. **It coincides with guest worker threads dying.** A healthy round ends
-//!    with four of them live; a bad one with one. That is the strongest lead
-//!    left, and it is what this example prints first on every line.
+//!    with four of them live; a bad one with fewer. Neutralising the
+//!    thread-status profiler saves two of them — a bad round then ends with
+//!    three — and does not stop the corruption.
+//! 8. **The discriminator is exact, and it is the heap.** Every round, in every
+//!    configuration tried: corrupt runs end with the guest heap at `0x10e0000`
+//!    and healthy ones at `0xf10000`. Not a distribution — two values, and
+//!    which one you get is which outcome you get. Something takes a different
+//!    path and allocates ~1.9 MB more.
+//! 9. **The result is settled, not racing.** Reading the whole image twice in
+//!    a row gives identical bytes, so none of this is a torn read.
 //!
 //! Together those say the host and the guest are looking at different memory,
 //! while every mechanism that could explain how is ruled out above. That is
@@ -316,11 +324,17 @@ fn round(bytes: &[u8], index: usize) -> bool {
     runtime.settle(std::time::Duration::from_secs(5));
 
     let after = snapshot(&runtime, base, size);
+    // Read it again. If the two disagree, the image is moving under the reader
+    // and nothing taken from a single snapshot means anything; if they agree,
+    // whatever happened has settled.
+    let again = snapshot(&runtime, base, size);
+    let stable = again.memory == after.memory;
     let (after_lines, after_structured) = after.structured();
     let healthy = after_structured > 0;
 
     println!(
-        "{index:>3}: {attempts} attempt(s) | live threads {} | ring {base:#x}+{size:#x} | \
+        "{index:>3}: {attempts} attempt(s) | live threads {} | stable {stable} | \
+         ring {base:#x}+{size:#x} | \
          memory {:#x} -> {:#x} | before {before_lines} \
          lines/{before_structured} structured | after {after_lines}/{after_structured} | {}",
         runtime.live_threads(),
