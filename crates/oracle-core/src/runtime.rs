@@ -1037,6 +1037,22 @@ impl Runtime {
         self.state().shared.watch.set(watch).is_ok()
     }
 
+    /// Makes guest threads take strict turns from now on.
+    ///
+    /// **Slow enough to be unusable for a whole run** — a two-minute round did
+    /// not finish in ten — because a worker blocked in `memory.atomic.wait32`
+    /// holds its turn from inside wasm where nothing can take it back, so every
+    /// other thread pays `TURN_TIMEOUT` to get past it. Switch it on around the
+    /// one operation being investigated, not at startup.
+    ///
+    /// What it buys is attribution: `watch_memory`'s "this thread wrote it"
+    /// only means anything while one thread runs at a time. There is no point
+    /// switching it on after the watch has fired — the transition it would
+    /// attribute has already happened.
+    pub fn demand_strict_turns(&self) {
+        self.state().shared.demand_strict_turns();
+    }
+
     /// The most guest threads that have executed at once during this run.
     ///
     /// Must be 1. See `SharedHost::max_in_wasm`.
@@ -1053,7 +1069,7 @@ impl Runtime {
             return Vec::new();
         };
         let sightings = watch.sightings.lock().unwrap_or_else(|e| e.into_inner());
-        sightings.iter().map(|(_, line)| line.clone()).collect()
+        sightings.iter().map(|(_, _, line)| line.clone()).collect()
     }
 
     /// Where the coherence witness sits, and how long it is.

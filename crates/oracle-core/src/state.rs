@@ -94,9 +94,15 @@ pub struct HostState {
     /// `SharedHost::seed_for`.
     rng: std::cell::Cell<u64>,
     /// Whether the watched span was intact the last time this thread entered
-    /// guest code. See `host::install_memory_watch` — this is what turns "the
-    /// span broke" into "this thread broke it".
-    pub watch_intact_entering_wasm: std::cell::Cell<bool>,
+    /// guest code — and `None` when that entry happened while threads were
+    /// still running concurrently, which makes the reading worthless.
+    ///
+    /// See `host::install_memory_watch`. Invalidating rather than recording a
+    /// stale `true` is the difference between naming one writer and naming
+    /// three: a thread that entered wasm before the damage and returned after
+    /// it reports "intact when I started, broken now" perfectly truthfully,
+    /// while five other threads were running the whole time.
+    pub watch_intact_entering_wasm: std::cell::Cell<Option<bool>>,
     /// Values handed to the guest as `emscripten::val` handles. See `emval.rs`.
     pub emval: crate::emval::EmvalTable,
 }
@@ -169,7 +175,7 @@ impl HostState {
             threads,
             memory_export: None,
             rng: std::cell::Cell::new(SharedHost::seed_for(thread_id)),
-            watch_intact_entering_wasm: std::cell::Cell::new(true),
+            watch_intact_entering_wasm: std::cell::Cell::new(None),
             emval: crate::emval::EmvalTable::default(),
         }
     }

@@ -103,18 +103,8 @@ where
     })
 }
 
-/// Names the moment a watched span of guest memory stopped holding what it did.
-///
-/// The interesting part is the backtrace. A host call happens *inside* guest
-/// code, so capturing here says which guest functions were on the stack when
-/// the damage was first visible — which is the difference between "memory was
-/// destroyed somewhere in `startVoipCall`" and a call chain to read.
-///
-/// Reported through the host log rather than returned: this is a diagnostic
-/// about a fault the host did not cause, and failing the call would replace the
-/// symptom under investigation with a different one.
-/// Installs the memory watch on a store, so every entry into host code checks
-/// it.
+/// Installs the memory watch on a store, so every crossing of the host boundary
+/// checks it.
 ///
 /// A `call_hook` rather than a check inside `host_func`, and the difference is
 /// the whole reason this works. Host functions arrive by three routes —
@@ -125,26 +115,44 @@ where
 /// guest memory, and silence reads as "nothing wrote there" when it means
 /// "nothing looked". This hook is the one place the VM guarantees every host
 /// call passes through, however the function was defined.
-/// Checking **both** directions is what makes it name a culprit rather than a
-/// witness. Guest threads run one at a time, so no other thread can execute
-/// while this one is inside guest code: a span that was intact when a thread
-/// entered wasm and is broken when it comes back was broken by that thread's
-/// own guest code. Checking only on the way in reports whoever happened to make
-/// the next host call — the first catch that way was a media worker asleep in
-/// `pj_thread_sleep`, which had written nothing.
+///
+/// Checking **both** directions is what lets it name a culprit rather than a
+/// witness: a span that was intact when a thread entered wasm and is broken
+/// when it comes back was broken by that thread's own guest code. Checking only
+/// on the way in reports whoever happened to make the next host call — the
+/// first catch that way was a media worker asleep in `pj_thread_sleep`, which
+/// had written nothing.
+///
+/// That argument needs one guest thread at a time, which is *not* how this host
+/// normally runs — see `Runtime::demand_strict_turns`, which an investigator
+/// has to switch on *before* the operation under suspicion. Switching it on
+/// when the watch breaks was tried and cannot work: attribution catches the
+/// transition from intact to broken, and by the time anything has noticed, the
+/// transition is over. Every sighting after it reads "already broken before
+/// this thread ran", correctly and uselessly.
 pub fn install_memory_watch(store: &mut Store<HostState>) {
     store.call_hook(|mut context, hook| {
         let intact = context.data().watch_intact();
+        let strict = context.data().shared.strict_turns();
+        let thread = context.data().thread_id;
         if hook.exiting_host() {
-            context.data().shared.entered_wasm();
-            if let Some(intact) = intact {
-                context.data().watch_intact_entering_wasm.set(intact);
+            if strict {
+                context.data().shared.scheduler.acquire(thread);
             }
+            context.data().shared.entered_wasm();
+            // Only worth recording under strict turns; see the field's docs.
+            context
+                .data()
+                .watch_intact_entering_wasm
+                .set(if strict { intact } else { None });
         } else {
             context.data().shared.left_wasm();
             if intact == Some(false) {
-                let wrote_it = context.data().watch_intact_entering_wasm.get();
-                report_broken_watch(&mut context, wrote_it);
+                let entry = context.data().watch_intact_entering_wasm.get();
+                report_broken_watch(&mut context, entry == Some(true), entry.is_some());
+            }
+            if strict {
+                context.data().shared.scheduler.release(thread);
             }
         }
         Ok(())
@@ -161,7 +169,11 @@ pub fn install_memory_watch(store: &mut Store<HostState>) {
 /// Reported through the host log rather than returned as a trap: this is a
 /// diagnostic about a fault the host did not cause, and failing the call would
 /// replace the symptom under investigation with a different one.
-fn report_broken_watch(context: &mut wasmtime::StoreContextMut<'_, HostState>, wrote_it: bool) {
+fn report_broken_watch(
+    context: &mut wasmtime::StoreContextMut<'_, HostState>,
+    wrote_it: bool,
+    sound: bool,
+) {
     let Some(watch) = context.data().shared.watch.get() else {
         return;
     };
@@ -174,8 +186,13 @@ fn report_broken_watch(context: &mut wasmtime::StoreContextMut<'_, HostState>, w
         // One sighting per thread. Taken before the expensive part so that a
         // thread already recorded pays nothing but a lock.
         let sightings = watch.sightings.lock().unwrap_or_else(|e| e.into_inner());
+        // Keyed on the thread *and* on whether the reading is attributable: a
+        // thread that reported before strict turns began must be allowed to
+        // report again once its answer means something.
         if sightings.len() >= crate::shared::MAX_SIGHTINGS
-            || sightings.iter().any(|(id, _)| *id == thread)
+            || sightings
+                .iter()
+                .any(|(id, was_sound, _)| *id == thread && *was_sound == sound)
         {
             return;
         }
@@ -200,10 +217,10 @@ fn report_broken_watch(context: &mut wasmtime::StoreContextMut<'_, HostState>, w
     let report = format!(
         "watch {at:#x} broken, thread {thread} {}, \
          memory {size:#x} and {zeros}% zero bytes, guest stack: {}",
-        if wrote_it {
-            "WROTE IT (span was intact when this thread entered wasm)"
-        } else {
-            "only saw it (already broken before this thread ran)"
+        match (wrote_it, sound) {
+            (true, true) => "WROTE IT",
+            (true, false) => "wrote it, unattributable (threads were still concurrent)",
+            (false, _) => "only saw it (already broken before this thread ran)",
         },
         if frames.is_empty() {
             "<none>".to_owned()
@@ -215,7 +232,7 @@ fn report_broken_watch(context: &mut wasmtime::StoreContextMut<'_, HostState>, w
         .sightings
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((thread, report.clone()));
+        .push((thread, sound, report.clone()));
     context.data().shared.log(thread, report);
 }
 

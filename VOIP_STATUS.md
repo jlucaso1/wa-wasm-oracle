@@ -1322,6 +1322,17 @@ one thread runs at a time; with six, four threads report it at once and all four
 reports are worthless. Fixing the concurrency is a precondition for naming the
 writer, not an alternative to it.
 
+Switching to strict turns *when the watch fires* looks like a way out of that
+and is not: attribution catches the transition from intact to broken, and by the
+time anything has noticed, the transition is over. Measured — with it on, a
+corrupt round produces ten sightings and every one of them says "already broken
+before this thread ran", correctly and uselessly. `Runtime::demand_strict_turns`
+is therefore something to switch on *before* the operation under suspicion, at
+the cost of the slowdown above, and that is the next experiment worth running:
+strict turns for the duration of `startVoipCall` alone, with `TURN_TIMEOUT` cut
+right down so that the degradation is graceful rather than a five-second stall
+per crossing.
+
 #### What is fixed, and what is not
 
 The fault is not fixed. What is fixed is the oracle answering from it.
