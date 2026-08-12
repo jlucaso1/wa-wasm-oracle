@@ -69,7 +69,48 @@ pub struct Runtime {
     pub unstubbable: Vec<String>,
     /// Address and size of the engine's log ring buffer, once attached.
     log_ring: Option<(u32, u32)>,
+    /// A slice of the module's own static data, and where it belongs.
+    ///
+    /// Written once when the module's constructors run and never again —
+    /// string literals and lookup tables live there — so it is a witness that
+    /// the host's view of guest memory still matches the guest's. See
+    /// `memory_view_is_coherent`.
+    canary: Option<(u32, Vec<u8>)>,
 }
+
+/// Chooses a slice of the module's static data to watch, out of live memory.
+///
+/// The first long run of printable ASCII above the reserved area is a string
+/// table: placed at startup and read forever after, so a difference in it is
+/// never the guest changing its mind.
+fn canary_at(runtime: &Runtime) -> Option<(u32, Vec<u8>)> {
+    /// Where to start looking. Below this is emscripten's reserved area and the
+    /// stack, neither of which is constant.
+    const FROM: u32 = 0x1_0000;
+    /// How far to look before giving up.
+    const WINDOW: u32 = 1 << 20;
+
+    // A run of printable ASCII this long is a string table, and a string table
+    // is written once and read forever.
+    //
+    // Read out of *memory* rather than out of the module's data segments,
+    // because a module built for shared memory has passive segments: they carry
+    // no static offset, so there is nothing to watch until `memory.init` has
+    // placed them. By this point it has.
+    let region = runtime.read(FROM, WINDOW).ok()?;
+    let printable = |byte: &u8| byte.is_ascii_graphic() || *byte == b' ';
+    let start = region
+        .windows(CANARY_BYTES)
+        .position(|window| window.iter().all(printable))?;
+    let at = FROM + u32::try_from(start).ok()?;
+    Some((at, region[start..start + CANARY_BYTES].to_vec()))
+}
+
+/// How much static data to remember as the witness.
+///
+/// Small on purpose. The failure this exists for replaces the whole of memory,
+/// so a larger sample would cost more and prove nothing extra.
+const CANARY_BYTES: usize = 256;
 
 /// The name a module exports its memory under.
 ///
@@ -127,6 +168,7 @@ impl Runtime {
         // the whole budget, and only `Runtime::drop` ever spends it.
         store.set_epoch_deadline(1);
         store.set_fuel(DEFAULT_FUEL).ok();
+        crate::host::install_memory_watch(&mut store);
 
         let mut linker = Linker::new(&engine);
         // Emscripten declares each import once, but a defensive allow keeps a
@@ -171,6 +213,7 @@ impl Runtime {
             instance,
             unstubbable,
             log_ring: None,
+            canary: None,
         };
         runtime.sync_memory();
         Ok(runtime)
@@ -315,6 +358,18 @@ impl Runtime {
         }
 
         if ran {
+            // Take the coherence witness here rather than at instantiation.
+            //
+            // This module carries **passive** data segments, as any
+            // shared-memory build does: they name no static offset, and
+            // `memory.init` places them from `__wasm_init_memory`, which
+            // wasm-ld calls at the top of `__wasm_call_ctors` when there is no
+            // start section. So at instantiation linear memory is still zeroed
+            // and there is no static data to watch — sampling there returned
+            // `None` on every run and left `memory_view_is_coherent` unable to
+            // answer, which is the quiet way for this guard to be absent
+            // rather than wrong.
+            self.canary = canary_at(self);
             Ok(())
         } else {
             Err(anyhow!("module exports no constructor entry point"))
@@ -878,6 +933,17 @@ impl Runtime {
         let Some((buffer, size)) = self.log_ring else {
             return Vec::new();
         };
+        // Nothing rather than noise. When the host's view has gone wrong this
+        // buffer reads as hundreds of high-entropy lines, and a caller that
+        // takes them for engine output concludes something about a run that
+        // never happened.
+        if self.memory_view_is_coherent() == Some(false) {
+            self.state().log(
+                "engine log withheld: the host's view of guest memory no longer \
+                 matches the module's own static data",
+            );
+            return Vec::new();
+        }
         let Some(used) = self.ring_used(buffer, size) else {
             return Vec::new();
         };
@@ -900,6 +966,133 @@ impl Runtime {
     /// index into it from an earlier read points somewhere else. Callers that
     /// diff two reads have to treat it as "this comparison is invalid" rather
     /// than as a gap.
+    /// Where the engine's log ring is, and how big: `(base, bytes)`.
+    ///
+    /// The host allocated it, so the host can say where it is — which is what
+    /// makes the ring usable as a *witness*. It sits in the guest heap like any
+    /// other allocation, so anything that writes over live memory near it
+    /// leaves its damage at an address and a length already known here, rather
+    /// than somewhere that only surfaces when `free` refuses the result.
+    /// The host-side address the guest's memory currently starts at.
+    ///
+    /// Diagnostic only, and it exists because "the guest corrupted itself" and
+    /// "the host is looking somewhere else" are indistinguishable from the
+    /// contents alone. If this changes between two reads, every pointer the
+    /// host has cached — and every base a guest thread's instance compiled in
+    /// — is talking about a different mapping.
+    pub fn memory_base(&self) -> Option<usize> {
+        self.store
+            .data()
+            .memory
+            .as_ref()
+            .map(|memory| memory.data().as_ptr() as usize)
+    }
+
+    /// Whether the host's view of guest memory still matches the guest's.
+    ///
+    /// **An oracle that answers from the wrong memory is worse than one that
+    /// refuses**, and this host can end up doing exactly that: about one run in
+    /// four, an incoming offer followed by an outgoing call leaves every byte
+    /// the host reads different from what the guest sees, while the guest keeps
+    /// executing correctly — `emscripten_stack_get_base` still answers
+    /// `0x24cf60`. `examples/ring_corruption.rs` measures it and
+    /// `VOIP_STATUS.md` records what is and is not known about why.
+    ///
+    /// The check is a slice of the module's own static data, sampled once its
+    /// constructors have placed it. Nothing writes over a string literal, so a
+    /// difference here is not the guest changing its mind.
+    ///
+    /// `None` means there was no static data to watch — a fact about the
+    /// module, not an answer about this run.
+    pub fn memory_view_is_coherent(&self) -> Option<bool> {
+        let (at, expected) = self.canary.as_ref()?;
+        let len = u32::try_from(expected.len()).ok()?;
+        Some(self.read(*at, len).is_ok_and(|actual| actual == *expected))
+    }
+
+    /// Starts watching the module's static data for the moment it changes.
+    ///
+    /// The coherence check answers *whether* memory went wrong, which is enough
+    /// to refuse a bad answer and not enough to find the cause. This answers
+    /// *when*: the span is compared on entry to every host call, and the first
+    /// call to see it changed reports its thread and the guest stack it was
+    /// called from. See `report_broken_watch` in `host.rs`.
+    ///
+    /// Returns whether a watch was set — `false` when the module offered no
+    /// static data to watch, or when one is already running.
+    pub fn watch_memory(&mut self) -> bool {
+        /// Enough to be certain, short enough that comparing it on every host
+        /// call does not dominate the run.
+        const SPAN: usize = 64;
+
+        let Some((at, expected)) = self.canary.as_ref() else {
+            return false;
+        };
+        let watch = crate::shared::MemoryWatch {
+            at: *at,
+            expected: expected[..SPAN.min(expected.len())].to_vec(),
+            broken: std::sync::atomic::AtomicBool::new(false),
+            sightings: std::sync::Mutex::new(Vec::new()),
+        };
+        self.state().shared.watch.set(watch).is_ok()
+    }
+
+    /// Makes guest threads take strict turns from now on.
+    ///
+    /// **Slow enough to be unusable for a whole run** — a two-minute round did
+    /// not finish in ten — because a worker blocked in `memory.atomic.wait32`
+    /// holds its turn from inside wasm where nothing can take it back, so every
+    /// other thread pays `TURN_TIMEOUT` to get past it. Switch it on around the
+    /// one operation being investigated, not at startup.
+    ///
+    /// What it buys is attribution: `watch_memory`'s "this thread wrote it"
+    /// only means anything while one thread runs at a time. There is no point
+    /// switching it on after the watch has fired — the transition it would
+    /// attribute has already happened.
+    pub fn demand_strict_turns(&self) {
+        self.state().shared.demand_strict_turns();
+    }
+
+    /// Every guest memory growth seen, with the guest stack behind it.
+    pub fn growths(&self) -> Vec<String> {
+        self.state().shared.growths()
+    }
+
+    /// The most guest threads that have executed at once during this run.
+    ///
+    /// Must be 1. See `SharedHost::max_in_wasm`.
+    pub fn max_threads_in_wasm(&self) -> usize {
+        self.state().shared.max_threads_in_wasm()
+    }
+
+    /// What the watch saw, one line per thread that saw it.
+    ///
+    /// Read from the watch rather than from the host log on purpose: see
+    /// `MemoryWatch::sightings`.
+    pub fn watch_report(&self) -> Vec<String> {
+        let Some(watch) = self.state().shared.watch.get() else {
+            return Vec::new();
+        };
+        let sightings = watch.sightings.lock().unwrap_or_else(|e| e.into_inner());
+        sightings.iter().map(|(_, _, line)| line.clone()).collect()
+    }
+
+    /// Where the coherence witness sits, and how long it is.
+    ///
+    /// Exposed so a caller can clobber it on purpose. The fault this guards
+    /// against appears about one run in four, which is no basis at all for
+    /// believing the refusal fires — five consecutive healthy runs of
+    /// `settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` proved
+    /// exactly nothing about it.
+    pub fn coherence_witness(&self) -> Option<(u32, u32)> {
+        let (at, expected) = self.canary.as_ref()?;
+        Some((*at, u32::try_from(expected.len()).ok()?))
+    }
+
+    pub fn log_ring(&self) -> Option<(u32, u32)> {
+        self.log_ring
+    }
+
     pub fn engine_log_overflowed(&mut self) -> bool {
         if self.log_ring.is_none() {
             return false;

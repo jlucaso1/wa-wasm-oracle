@@ -17,9 +17,8 @@
 //!
 //! # Why these are `#[ignore]`d
 //!
-//! Not because they are unreliable — because they are slow. Each brings up
-//! PJSIP's worker pool under host-driven scheduling, and the file takes about
-//! four minutes:
+//! Because they are slow. Each brings up PJSIP's worker pool under host-driven
+//! scheduling, and the file takes about fifteen minutes:
 //!
 //! ```sh
 //! cargo test --release --test signaling -- --ignored --test-threads 1
@@ -29,7 +28,7 @@
 //!
 //! # What it took to make them reliable
 //!
-//! Two separate problems, both measured rather than guessed:
+//! Four separate problems, each measured rather than guessed:
 //!
 //! - **Startup raced about one time in nine.** `initVoipStack` finishes in
 //!   ~5 ms, and the trap landed with 99.6% of the fuel untouched and the media
@@ -40,6 +39,23 @@
 //! - **Offer handling is asynchronous.** The call returning says nothing about
 //!   whether the event thread has done the work, so `wait_for_reaction` waits
 //!   for the log to grow and then go quiet instead of sleeping a fixed amount.
+//! - **Startup is not one burst of logging**, so "the log went quiet" is not
+//!   "startup finished". Under load the gap between the media stack finishing
+//!   and `call_event_proc` starting exceeds `QUIET`, and an offer delivered
+//!   into it is handled by an engine that has not finished starting.
+//!   `engine_with` waits for `call_event_proc resumed` — the last line startup
+//!   writes — and treats not reaching it as a failed startup.
+//! - **The engine's lock watchdog fires on the offer path**, about one run in
+//!   four, and it is ours: `schedule.rs` lets a worker hold a lock across its
+//!   whole turn, so the main thread meets the engine's locks in an order its
+//!   design does not admit. The run is identical to a good one and then stops
+//!   one line short of `wa_call_handle_incoming_xmpp_offer() status 0`. See
+//!   `deliver_without_a_lock_inversion`, which retries on exactly that
+//!   complaint and on nothing else.
+//!
+//! The last two are why this file used to say "not because they are unreliable
+//! — because they are slow", while `a_well_formed_offer_is_accepted` failed
+//! about one run in four. It was both.
 //!
 //! `examples/init_stress.rs` measures the startup race if the rate needs
 //! rechecking after a capture update.
@@ -154,7 +170,111 @@ fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
     // threads to finish: PJSIP's worker is a loop bounded only by its fuel, so
     // a full quiesce would always time out.
     wait_for_reaction(&mut runtime, 0);
+
+    // And then wait for the *event thread*, which is a different thing and is
+    // what an offer is handed to.
+    //
+    // `wait_for_reaction` waits for the log to go quiet, and startup is not one
+    // continuous burst of logging: under load it can pause for longer than
+    // `QUIET` between the media stack finishing and `call_event_proc` starting.
+    // An offer delivered into that gap is handled by a half-started engine,
+    // which does not look like a timing problem at all — it looks like the
+    // engine refusing the stanza:
+    //
+    //     record_incoming_msg: no active call
+    //     Application settings not loaded
+    //     Failed to get voip storage dir
+    //
+    // and `wa_call_handle_incoming_xmpp_offer() status 0` never appears. That
+    // is what made `a_well_formed_offer_is_accepted` and
+    // `offer_handling_is_deterministic` fail about one run in seven, on a suite
+    // documented as slow but not flaky.
+    //
+    // `call_event_proc resumed` is the last line startup writes, at the default
+    // log level, and it means the event thread is running and idle. Not
+    // reaching it is a failed startup like any other, so it goes back through
+    // the retry above rather than into a test.
+    if policy == ThreadPolicy::Spawn && !wait_for_line(&mut runtime, "call_event_proc resumed") {
+        return Err(EngineError::InitFailed(
+            "the event thread never announced itself".to_owned(),
+        ));
+    }
     Ok(runtime)
+}
+
+/// Delivers an offer on a fresh engine until the engine's own lock watchdog
+/// stays quiet, and returns what it logged.
+///
+/// **What is being retried is a harness artifact, not a verdict.** A run that
+/// ends like this —
+///
+/// ```text
+/// events/eve  EVENT: Call missed by the user
+///   wa_os.cc  Mutex scope=0, priority=1: name=, owner=thr0x14b00c, taken=1
+///   wa_os.cc  check_locking_order wrong order for mutex scope=0, priority=0
+/// ```
+///
+/// is byte-for-byte identical to a good one up to that point and then stops:
+/// `wa_call_handle_incoming_xmpp_offer() status 0`, the line the synchronous
+/// call writes on its way out, never arrives. The engine caught a lock-order
+/// inversion and dumped its mutexes instead of finishing.
+///
+/// It is ours. `schedule.rs` runs one guest thread at a time, so a worker can
+/// hold a lock across its whole turn and the main thread meets the engine's
+/// locks in an order its design does not admit. `schedule.rs` says the
+/// lock-order complaints are "a symptom of something else"; this is the
+/// something else, and it is the scheduler that buys everything around it.
+///
+/// So the retry is conditioned on that complaint and nothing else. An engine
+/// that answers — with any status, including a refusal — is returned as it is,
+/// and the test judges it.
+fn deliver_without_a_lock_inversion(runtime: &mut Runtime, stanza: &str) -> Vec<String> {
+    // Four, not more. Each attempt builds a fresh engine and `engine()` retries
+    // startup six times inside that, so the two multiply; measured, four
+    // rounds of `a_well_formed_offer_is_accepted` passed in 37-53 s each,
+    // which is two or three attempts.
+    const ATTEMPTS: usize = 4;
+
+    for attempt in 1..=ATTEMPTS {
+        let lines = deliver(runtime, stanza.to_owned());
+        if !lines
+            .iter()
+            .any(|line| line.contains("check_locking_order"))
+        {
+            return lines;
+        }
+        if attempt == ATTEMPTS {
+            return lines;
+        }
+        eprintln!("lock-order inversion handling the offer (attempt {attempt}); fresh engine");
+        let Some(fresh) = engine() else {
+            return lines;
+        };
+        *runtime = fresh;
+    }
+    unreachable!("the loop returns on its last attempt")
+}
+
+/// Waits for a line to appear in the engine's log, draining as it goes.
+///
+/// Matched on a distinctive substring, and `call_event_proc resumed` is one —
+/// but see the module docs for why that is worth checking every time: the
+/// obvious needle for the call-stack banner turned out to be a substring of an
+/// unrelated line, and the test passed on a stanza that never parsed.
+fn wait_for_line(runtime: &mut Runtime, needle: &str) -> bool {
+    let deadline = std::time::Instant::now() + REACT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if runtime
+            .engine_log()
+            .iter()
+            .any(|line| line.contains(needle))
+        {
+            return true;
+        }
+        runtime.process_queued_calls();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 macro_rules! engine_or_skip {
@@ -263,6 +383,14 @@ fn offer_for(runtime: &Runtime) -> Node {
 }
 
 fn deliver(runtime: &mut Runtime, stanza: String) -> Vec<String> {
+    // Deliberately *not* draining the proxy queue first, and it is worth
+    // knowing why. Work the engine parks for the main thread during startup
+    // looks like something that should run before the offer, so running it
+    // here was tried: `a_well_formed_offer_is_accepted` then fails four times
+    // out of four, where it had been failing about one in five. Whatever that
+    // queued work does, doing it immediately before the offer is worse than
+    // leaving it, which also says the half-started engine below is not simply
+    // "the queue had not been drained".
     let mark = runtime.engine_log().len();
     runtime.clear_calls();
 
@@ -505,8 +633,11 @@ fn offer_handling_is_deterministic() {
     let mut second = engine().expect("second instance");
 
     let stanza = serialize(&offer_for(&first), true);
-    let a = events(deliver(&mut first, stanza.clone()));
-    let b = events(deliver(&mut second, stanza));
+    // Both sides through the lock-watchdog retry: an inversion stops the
+    // reaction one line short of `status 0`, and comparing an abandoned run
+    // against a completed one is not a determinism result either way.
+    let a = events(deliver_without_a_lock_inversion(&mut first, &stanza));
+    let b = events(deliver_without_a_lock_inversion(&mut second, &stanza));
 
     assert_eq!(a, b, "two runs reached different engine events");
     assert!(!a.is_empty(), "no events recorded at all");
@@ -584,6 +715,134 @@ fn the_log_reader_returns_only_the_log() {
             "not a log line: {line:?}"
         );
     }
+}
+
+/// Guest threads are **not** serialised, and this pins that down.
+///
+/// `schedule.rs` is supposed to run one guest thread at a time, and several
+/// safety arguments in this codebase lean on it — `HostState::read`'s SAFETY
+/// note among them. It does not hold: a thread acquires the turn once around
+/// its whole routine, and `yield_point` hands it on only while some other
+/// thread is blocked in its own first `acquire`, so once every worker has
+/// forced past `TURN_TIMEOUT` nothing waits and nothing yields.
+///
+/// Asserted the way it actually is, rather than the way it should be, because a
+/// permanently red test teaches nobody anything and a silent one hides this
+/// entirely. **If this test starts failing, the scheduler has been fixed** —
+/// which is good news, and the thing to do is update it along with the notes in
+/// `AGENTS.md`, `threads.rs` and `examples/ring_corruption.rs` that all say
+/// otherwise.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn guest_threads_are_not_serialised() {
+    let _serial = threaded_guard();
+    let runtime = engine_or_skip!();
+
+    let peak = runtime.max_threads_in_wasm();
+    eprintln!("most guest threads executing at once: {peak}");
+    assert!(
+        peak > 1,
+        "the scheduler now serialises guest threads — see this test's docs, \
+         several comments claim the opposite and need updating"
+    );
+}
+
+/// The memory watch fires, and says which thread and which guest stack.
+///
+/// This exists because the watch's *silence* was briefly taken as evidence.
+/// The first version checked only inside `host_func`, and `emscripten.rs`
+/// defines most of its functions with `func_wrap`, so it stayed quiet through a
+/// round that destroyed ten megabytes of guest memory — reported as "nothing
+/// wrote to the watched span", meaning "nothing looked at it".
+///
+/// A watch that cannot be seen to fire is worth nothing, so this makes it fire:
+/// arm it, change the span, then let the engine's workers make host calls.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn the_memory_watch_names_the_moment() {
+    let _serial = threaded_guard();
+    let mut runtime = engine_or_skip!();
+
+    assert!(runtime.watch_memory(), "no static data to watch");
+    let (at, len) = runtime.coherence_witness().expect("witness");
+    runtime
+        .write_bytes_at(at, &vec![0xFF; len as usize])
+        .expect("clobber the watched span");
+
+    // The workers poll, so they reach a host call within milliseconds; this is
+    // waiting for the report rather than for anything to happen.
+    runtime.settle(Duration::from_secs(2));
+
+    // From the watch, not from the host log: the log refuses new lines once
+    // full, and this report was being written past that point and discarded.
+    let report = runtime
+        .watch_report()
+        .into_iter()
+        .next()
+        .expect("the watch never fired on a span that was definitely changed");
+    assert!(
+        report.contains("guest stack:"),
+        "the report must carry the guest stack, which is the whole point of it: {report}"
+    );
+}
+
+/// The log is withheld when the host's view of guest memory has gone wrong.
+///
+/// About one run in four, an incoming offer followed by an outgoing call leaves
+/// the host reading entirely different bytes from the guest, and the ring comes
+/// back as hundreds of lines of high-entropy noise. `engine_log` refuses in
+/// that case — but waiting for a 1-in-4 fault to demonstrate the refusal is not
+/// a test, it is a hope. Five consecutive runs of
+/// `settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` came back
+/// healthy and said nothing about whether the refusal works.
+///
+/// So the fault is induced instead: overwrite the witness and the log must go
+/// away; put it back and the log must return. The second half is what makes
+/// this a test of a live check rather than of a latch that trips once.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn an_incoherent_memory_view_withholds_the_log() {
+    let _serial = threaded_guard();
+    let mut runtime = engine_or_skip!();
+
+    let (at, len) = runtime
+        .coherence_witness()
+        .expect("no witness: the module placed no static data to watch");
+    let original = runtime.read(at, len).expect("read witness");
+
+    assert_eq!(runtime.memory_view_is_coherent(), Some(true));
+    assert!(
+        !runtime.engine_log().is_empty(),
+        "engine produced no log to withhold"
+    );
+
+    runtime
+        .write_bytes_at(at, &vec![0xFF; original.len()])
+        .expect("clobber witness");
+
+    assert_eq!(runtime.memory_view_is_coherent(), Some(false));
+    assert!(
+        runtime.engine_log().is_empty(),
+        "the log was returned from a view known to be wrong"
+    );
+    assert!(
+        runtime
+            .logs()
+            .iter()
+            .any(|line| line.contains("engine log withheld")),
+        "the refusal was silent; a caller has no way to tell it apart from an empty log"
+    );
+
+    // Static data is written once and read forever, so restoring it leaves the
+    // guest exactly as it was — which is also why it is the right thing to
+    // watch.
+    runtime.write_bytes_at(at, &original).expect("restore");
+
+    assert_eq!(runtime.memory_view_is_coherent(), Some(true));
+    assert!(
+        !runtime.engine_log().is_empty(),
+        "the log did not come back once the view was good again"
+    );
 }
 
 /// A module with no ring attached has no log, rather than whatever its heap
@@ -724,7 +983,7 @@ fn call_id_must_sit_on_the_call_element() {
 fn a_well_formed_offer_is_accepted() {
     let mut runtime = engine_or_skip!();
     let payload = serialize(&offer_for(&runtime), true);
-    let lines = deliver(&mut runtime, payload);
+    let lines = deliver_without_a_lock_inversion(&mut runtime, &payload);
 
     // A missing line proves nothing once the ring has wrapped: the reader can
     // only return what is still in the buffer. Asserting through an overflow
@@ -769,6 +1028,11 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
     };
 
     let payload = serialize(&offer_for(&runtime), true);
+    // Plain `deliver`, not the lock-watchdog retry. What this asserts is that
+    // the *sequence* does not shred the engine's log, which an inversion does
+    // not affect — and routing it through the retry cost twenty minutes on its
+    // own, because a fresh engine per attempt compounds with the six startup
+    // retries inside `engine()`.
     let _ = deliver(&mut runtime, payload);
 
     let mark = runtime.engine_log().len();
@@ -789,27 +1053,54 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
 
     let lines = runtime.engine_log_from(mark);
 
-    // What this actually found: the sequence leaves the engine's log full of
-    // random bytes rather than messages. Every line is short, printable noise
-    // with none of the `file.cc`/`EVENT:` shape real entries have — the same
-    // "hundreds of garbage lines" seen before, which means state is corrupt
-    // rather than that the call went quiet.
+    // What this used to assert, and what it took to get here.
+    //
+    // About one run in four the ring came back holding 880 lines of
+    // high-entropy noise — `"E'8da(R#"`, `"8+bb=BX+"` — and this test read that
+    // as the engine's state being corrupted by the sequence. The noise was real
+    // and the reading was wrong twice over: it was not the ring, it was all of
+    // linear memory; and it was not the engine, it was **this host**.
+    //
+    // `env::get_random_bytes_js` takes `(len, buf)`, and the host had it as
+    // `(buf, len)`. The module's only caller of it is the crypto callback that
+    // `generate_raw_e2e_keys` dispatches through, which asks for 32 bytes; with
+    // the arguments swapped that became fifteen megabytes of the host's own
+    // PRNG written from address 32. The bytes really were key material, and the
+    // host was the one writing them.
     let structured = lines
         .iter()
         .filter(|line| line.contains(".c") || line.contains("EVENT") || line.contains("call"))
         .count();
     eprintln!(
-        "after an incoming offer, an outgoing call yields {} lines, {structured} of them structured",
-        lines.len()
+        "after an incoming offer, an outgoing call yields {} lines, {structured} of them structured; overflowed={}",
+        lines.len(),
+        runtime.engine_log_overflowed()
+    );
+    for line in lines.iter().take(6) {
+        eprintln!("  SAMPLE {line:?}");
+    }
+
+    // This is the regression guard for the swapped `get_random_bytes_js`
+    // arguments, and it is an assertion now rather than an `eprintln!`.
+    //
+    // For as long as the host read that import as `(buf, len)` instead of
+    // `(len, buf)`, this sequence destroyed the whole of linear memory about
+    // one run in four — a request for 32 bytes at `0xf00000` became fifteen
+    // megabytes of PRNG output written from address 32. The test tolerated it,
+    // because the cause was unknown and a red suite that could not be fixed
+    // teaches nobody anything. The cause is known, so the tolerance goes.
+    assert_ne!(
+        runtime.memory_view_is_coherent(),
+        Some(false),
+        "the host's view of guest memory went incoherent during offer-then-call — \
+         the corruption this used to tolerate is back; see `get_random_bytes_js` in \
+         emscripten.rs and examples/ring_corruption.rs"
     );
 
-    // So the useful invariant is about corruption, not about the guard: doing
-    // both in one engine must not shred the log. If this ever passes cleanly,
-    // the ordering has become usable and the settings hypothesis can finally be
-    // tested through it.
+    // And anything the engine did write has the shape of engine output.
     assert!(
         lines.is_empty() || structured > 0,
-        "the log is pure noise after offer-then-call: state is corrupted by the sequence"
+        "the log has lines but none of them are engine output: {lines:?}"
     );
 }
 

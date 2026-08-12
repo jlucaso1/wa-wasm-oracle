@@ -55,17 +55,12 @@ fn offer_stanza(caller: &Jid, now: u64) -> Node {
         .build()
 }
 
-/// The engine rejects a plain settings blob as "unexpected compressed voip
-/// params", so it expects the compressed form.
-fn compressed_settings() -> Vec<u8> {
-    use flate2::Compression;
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
-
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(SETTINGS).expect("compress");
-    encoder.finish().expect("finish")
-}
+// A `compressed_settings()` helper used to sit here, on the reading that the
+// engine "expects the compressed form" because it rejected a plain blob. It
+// does not: it rejects an *unmarked* one. `uncompressed="1"` above is the whole
+// answer, `an_unmarked_settings_blob_is_rejected` in `tests/signaling.rs` pins
+// it, and nothing ever called the helper. It took `flate2` out of the
+// dependency list with it.
 
 /// How the caller is identified.
 ///

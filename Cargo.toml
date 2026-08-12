@@ -34,6 +34,12 @@ wasmtime = { version = "41.0.4", default-features = false, features = [
     # which is how the exit-71 panic was traced back to a failing random_get.
     "addr2line",
     "demangle",
+    # The one hook every host call passes through, however it was defined.
+    # `host_func` and `sync_memory` between them still miss the hottest calls a
+    # guest worker makes — the clock — so a watch checked only there stays
+    # silent while ten megabytes of guest memory are destroyed. See
+    # `host::install_memory_watch`.
+    "call-hook",
 ] }
 
 [workspace.lints.rust]

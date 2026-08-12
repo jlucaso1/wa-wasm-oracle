@@ -7,10 +7,19 @@ first — it holds the module map, the recovered VoIP API, and the known limits.
 
 ```sh
 cargo fmt --all
-cargo clippy --all --tests --release -- -D warnings
+cargo clippy --all --tests --examples --release -- -D warnings
 cargo test --release
 cargo machete                 # no unused dependencies
 ```
+
+`--examples` is in that line deliberately. They were outside it, and what
+accumulated behind the gap was a dead helper carrying `flate2` — a whole
+dependency kept alive by a function nothing called.
+
+CI runs `stable`, which is ahead of the toolchain in this container. A clean
+local clippy is therefore not a clean CI clippy: `useless_borrows_in_formatting`
+failed the lint job on lines 1.94 accepts. When CI reports a lint you cannot
+reproduce, the version gap is the first thing to check, not the last.
 
 Always `--release` for anything that executes a module. In a debug build
 Cranelift compiles the 9.3 MiB VoIP module so slowly that runs look hung.
@@ -47,6 +56,15 @@ different code. Treat a capture bump as a re-derivation, never as an update.
   unregistered — so every call a worker queued for it was dropped, and the
   symptom surfaced thousands of instructions away. A miss now names the near
   misses, normalising leading underscores and case.
+- **A host import's declared type is not its argument order.** `(i32, i32)`
+  says nothing about which one is the buffer. `env::get_random_bytes_js` takes
+  `(len, buf)`, the host had it as `(buf, len)` by analogy with the
+  `getentropy(buf, len)` sitting directly above it, and a request for 32 bytes
+  at `0xf00000` became fifteen megabytes of PRNG written from address 32. That
+  one transposition was the ring corruption, the `free`-refusing-a-pointer trap,
+  and every "host and guest read different memory" theory this repository
+  accumulated. Read the call site: the bytecode pushes the constant, and
+  `oracle abi --index` shows it.
 - **Determinism is the product.** Anything that would vary between runs — clocks,
   randomness, filesystem — must be replaced by something reproducible. A
   comparison against whatsapp-rust is worthless if the oracle's own output
@@ -70,6 +88,16 @@ different code. Treat a capture bump as a re-derivation, never as an update.
   a host call, so the turn is yielded and the proxying queue drains.
   `startup_is_reliable_and_never_forces_a_turn` is the guard; `forced_turns()`
   must stay zero.
+- **Guest threads are not serialised, whatever `schedule.rs` says.** Measured:
+  `Runtime::max_threads_in_wasm()` peaks at **five or six**, in every round,
+  healthy and corrupt alike. A thread acquires the turn once around its whole
+  routine and `yield_point` hands it on only while somebody is blocked in their
+  own first `acquire`, so once every worker has forced past `TURN_TIMEOUT`
+  nothing waits and nothing yields. Making the turn cover exactly the
+  guest-execution window does serialise and is unusable — a two-minute round
+  had not finished in ten. Do not write code whose safety argument is "the
+  scheduler holds all but one thread outside guest code"; that is not true
+  today. `HostState::read`'s SAFETY note is the one place still saying it.
 - **Every test that starts an engine takes both locks.** `threaded_guard()`
   serialises within a test binary; `common::engine_lock()` serialises *across*
   them, because cargo runs the binaries in parallel and `threading`,
@@ -113,16 +141,23 @@ Host environment, in the order a module exercises it:
   only ends when its fuel runs out, so finished tests kept burning CPU. `Drop`
   signals a shutdown that every host call checks.
 
-## The signaling tests are slow, not flaky
+## The signaling tests are slow, and were flakier than this file claimed
 
-They bring up PJSIP's worker pool and take about four minutes, so they are
+They bring up PJSIP's worker pool and take about fifteen minutes, so they are
 `#[ignore]`d and run on their own:
 
 ```sh
 cargo test --release --test signaling -- --ignored --test-threads 1
 ```
 
-They used to be genuinely unreliable, and what fixed it is worth knowing:
+This heading used to end at "not flaky", while `a_well_formed_offer_is_accepted`
+failed about one run in four. Two more causes are now found and handled, both in
+the module docs of `signaling.rs`: startup returning before `call_event_proc`
+exists, and the engine's own lock watchdog firing on the offer path — the second
+is `schedule.rs`'s doing, and the retry for it is conditioned on that complaint
+and nothing else, so a real refusal still fails the test.
+
+What was already known, and still holds:
 
 - **Startup raced about one time in nine.** Measured with
   `examples/init_stress.rs`: `initVoipStack` finishes in ~5 ms, and the trap
@@ -154,12 +189,37 @@ so it works on captures that do not exist yet. The order that has paid off:
 
 ## Open work
 
-1. **`_start` on the media modules exits 71** before reading `argv`. Their
-   exported functions are callable directly, so this blocks nothing, but the
-   cause is unconfirmed — likely the file-handling callbacks
-   (`setFileHandlingCallback`).
-2. **Drive a full call flow**: `initVoipStack` then
+1. **Reconcile `participants[0]` with the bytecode.** `offer.cc:485` reads it as
+   null, and three static facts say it cannot be — see "What `l1` is" in
+   `VOIP_STATUS.md`. One of the two is measuring something else, and the probe
+   is the newer and less certain of them.
+2. **Guest threads run concurrently, on one stack.** Not the corruption — that
+   is fixed, see below — but real, measured, and load-bearing for anything
+   written near `schedule.rs`. `Runtime::max_threads_in_wasm()` peaks at five or
+   six when the design says one. Serialising properly is correct and unusable,
+   and giving each worker its own stack makes things worse by every route tried.
+   `VOIP_STATUS.md`, "Guest threads run concurrently, on one stack", has the
+   numbers.
+3. **Drive a full call flow**: `initVoipStack` then
    `handleIncomingSignalingOffer`, and compare the recorded
    `sendSignalingXMPP_js_sync` payloads against what whatsapp-rust emits. The
-   marshalling this needs is done; what is missing is a realistic offer payload.
-3. **Non-vector embind classes**, if a module ever registers one that matters.
+   marshalling this needs is done. What is in the way is not the payload but the
+   main-thread proxy queue — see `state.rs`: the engine queues its outbound
+   stanzas there and every drain fails while `register_main_thread` is off.
+   `init_stress --register-main-thread` measures what turning it on costs.
+4. **Re-check `examples/outgoing_call.rs`.** It used to end with corrupted
+   memory whichever stack the workers used, which is exactly what the
+   `get_random_bytes_js` transposition did to anything that reached key
+   generation. It has not been re-run since that was fixed. What follows is the
+   pre-fix note:
+
+   **What corrupts memory in `examples/outgoing_call.rs`.** It ends with traps
+   whichever stack the workers use, while `examples/profiler_flag.rs` — same
+   engine, same log level, same assert gate — has none. `startJsWorkerThread`
+   and `initSctpRingBuffer` are what remain untested between them.
+5. **Non-vector embind classes**, if a module ever registers one that matters.
+
+`_start` exiting 71 on the media modules used to head this list. It was already
+fixed by the WASI memory-window bug in the table above and nothing noticed,
+because the MP4 core was the one module in the lock that no test exercised.
+`the_mp4_core_reads_its_arguments` now does.

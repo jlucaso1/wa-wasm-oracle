@@ -45,6 +45,10 @@ fn main() -> anyhow::Result<()> {
             [(x * 16) as u8, (y * 16) as u8, 0x80, 0xff]
         })
         .collect();
+    // The stride the comment above `COMPONENTS` derives from the compress
+    // struct, asserted rather than described: getting it wrong is the mistake
+    // this example exists to have already made.
+    assert_eq!(pixels.len() as u32, WIDTH * HEIGHT * COMPONENTS);
 
     let alloc = |r: &mut Runtime, n: u32| -> u32 {
         let out = r.call("B", &[Val::I32(n as i32)]).ok();

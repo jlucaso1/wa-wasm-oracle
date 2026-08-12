@@ -64,10 +64,37 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
         },
     )?;
 
+    // **Length first, buffer second** — the opposite of `getentropy` above, and
+    // the single most expensive mistake in this host's history.
+    //
+    // This is not the standard emscripten import, it is WhatsApp's own, and its
+    // declared type `(i32, i32)` says nothing about which is which. Written by
+    // analogy with `getentropy(buf, len)`, it was backwards, and the bytecode
+    // says so plainly — from the only caller, the crypto callback in table slot
+    // 298 that `generate_raw_e2e_keys` dispatches through:
+    //
+    // ```
+    //     i32.const 32     ; the length: this callback rejects any other
+    //     local.get 0      ; the destination
+    //     call 8           ; env::get_random_bytes_js
+    // ```
+    //
+    // With the arguments swapped the host read the length as the destination
+    // and the destination as the length, so a request for 32 bytes at
+    // `0xf00000` became **fifteen megabytes of PRNG output written from address
+    // 32**. That is the "ring full of key material" this repository has been
+    // chasing: it was key material, and the host was writing it.
+    //
+    // It also explains why the failure looked like a coin flip with an exact
+    // discriminator. `HostState::write` refuses an out-of-bounds range, so the
+    // bogus write only lands when `32 + destination` still fits inside the
+    // memory — which is why a corrupt round always ended with the heap at
+    // `0x10e0000` and a healthy one at `0xf10000`. The heap size was not
+    // correlated with the corruption, it *decided* it.
     linker.func_wrap(
         "env",
         "get_random_bytes_js",
-        |mut caller: Caller<'_, HostState>, buf: i32, len: i32| {
+        |mut caller: Caller<'_, HostState>, len: i32, buf: i32| {
             crate::state::sync_memory(&mut caller);
             let _ = fill_random(&mut caller, buf as u32, len as u32);
         },
@@ -703,6 +730,15 @@ fn answer_em_asm(snippet: &str) -> i32 {
 
 /// Fills guest memory with bytes from the deterministic PRNG.
 fn fill_random(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> Result<()> {
+    // Recorded, because this is the host's only source of high-entropy bytes
+    // and the corruption in `examples/ring_corruption.rs` looks exactly like
+    // them. An earlier pass excluded this by instrumenting writes of 64 KiB or
+    // more — which says nothing about the same total arriving four kilobytes at
+    // a time.
+    caller
+        .data()
+        .record("env", "fill_random", vec![ptr as i64, len as i64]);
+
     let mut bytes = Vec::with_capacity(len as usize);
     {
         let state = caller.data();

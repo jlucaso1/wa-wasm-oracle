@@ -134,6 +134,34 @@ impl Spawner {
     }
 }
 
+/// Offset of `stack` in emscripten's `struct pthread` — the *top* of the
+/// thread's stack, since wasm stacks grow down. `stack_size` follows it at
+/// `+56`.
+///
+/// Measured rather than assumed: every worker in this capture reports a
+/// distinct value here and `0x10000` at `+56`, which is the 64 KiB the guest's
+/// own `pthread_create` allocated for it. Used below only to know when that
+/// control block has been filled in; see `run_thread` for why the host does not
+/// go on to install those bounds.
+const STACK_HIGH: u32 = 52;
+
+/// Reads a guest `u32`, or `None` if the address is out of bounds.
+///
+/// The read is of memory another thread may be writing. That is the point —
+/// this is how the host watches for `pthread_create` to finish filling in a
+/// control block it does not own.
+fn read_u32(store: &Store<HostState>, at: u32) -> Option<u32> {
+    let memory = store.data().memory.as_ref()?;
+    let data = memory.data();
+    let bytes = data.get(at as usize..at as usize + 4)?;
+    // SAFETY: a racy read of shared memory, deliberately. Each cell is read
+    // once and the result is only ever treated as a hint that is then range
+    // checked, so a torn value cannot become a wild pointer.
+    #[allow(unsafe_code)]
+    let word: Vec<u8> = bytes.iter().map(|cell| unsafe { *cell.get() }).collect();
+    Some(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+}
+
 /// Bundle passed into the new thread; keeps `run_thread`'s signature readable.
 struct Context_ {
     engine: Engine,
@@ -162,6 +190,9 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     // this costs nothing during a run and makes shutdown independent of the
     // worker reaching a host call.
     store.set_epoch_deadline(1);
+    // Worker threads are where the interesting host calls happen, so a watch
+    // installed only on the main store would miss most of them.
+    crate::host::install_memory_watch(&mut store);
 
     let mut linker = build_linker(&mut store, &ctx.module)?;
     linker
@@ -182,22 +213,8 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     {
         const SPINS: usize = 2000;
         for _ in 0..SPINS {
-            let ready = store
-                .data()
-                .memory
-                .as_ref()
-                .and_then(|memory| {
-                    let data = memory.data();
-                    let at = thread_ptr as usize + 52;
-                    let bytes = data.get(at..at + 4)?;
-                    // SAFETY: a read of bytes another thread is writing, which is
-                    // the point — shared memory is racy by design and this is
-                    // watching for the write to land.
-                    #[allow(unsafe_code)]
-                    let word: Vec<u8> = bytes.iter().map(|cell| unsafe { *cell.get() }).collect();
-                    Some(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-                })
-                .is_some_and(|top| top != 0);
+            let ready =
+                read_u32(&store, thread_ptr.saturating_add(STACK_HIGH)).is_some_and(|top| top != 0);
             if ready {
                 break;
             }
@@ -241,19 +258,43 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
             .context("__emscripten_thread_init")?;
     }
 
-    // Where this thread's stack actually is.
+    // No stack of its own for this thread, and that is now a measurement rather
+    // than an oversight — but read the measurement, because it says the
+    // opposite of what it should.
     //
-    // Threads are separate instances over one shared memory, and the stack
-    // pointer is a *per-instance* global — so unless something moves it, every
-    // thread starts from the module's initial value and they all write over the
-    // same region. That is invisible until a long-lived pointer into a caller's
-    // frame comes back wrong, which is exactly the shape of the bug being
-    // chased in VOIP_STATUS.md. Report it rather than assume `thread_init` did
-    // the right thing.
-    // Read through `stackSave`, not through an exported global. Global 0 *is*
-    // the stack pointer, but this module exports no globals — only a separately
-    // patched capture does — so asking for `__global_0` here logs nothing at
-    // all, which reads as "the stack is fine" rather than as "not measured".
+    // The stack pointer is a *per-instance* wasm global, every instance is
+    // initialised from the same module, and `__emscripten_thread_init` sets the
+    // TLS globals and nothing else. So every guest thread starts at `0x24cf60`,
+    // the main thread's own region, and pushes its frames over whatever is live
+    // there. That would be survivable if threads took turns; they do not.
+    // `Runtime::max_threads_in_wasm()` peaks at **five or six** — see the note
+    // in AGENTS.md — so this is five call stacks sharing one address range,
+    // which is indefensible on its face.
+    //
+    // Giving each thread its own stack nevertheless makes it strictly worse,
+    // three times now, by three different routes:
+    //
+    // | stack per worker              | result                                |
+    // | ----------------------------- | ------------------------------------- |
+    // | shared (today)                | ~1 corrupt round in 4                 |
+    // | the guest's own 64 KiB        | `startVoipCall` traps 4 attempts of 4 |
+    // | 4 MiB, confirmed by stackSave | "changes nothing"                     |
+    // | 1 MiB from the guest heap     | **8 corrupt rounds of 8**             |
+    //
+    // The last row is this host installing the stack through the module's own
+    // exports — `malloc`, then `emscripten_stack_set_limits(base, end)`, then
+    // `stackRestore(top)` — with the argument order checked against the
+    // bytecode (`base` is global 8, `end` is global 7). It is the correct thing
+    // to do and it fails every time, so something the guest believes about
+    // where a thread's stack lives is not what this host is telling it.
+    // Whoever picks this up: that contradiction is the lead, not the shared
+    // stack itself.
+
+    // The stack this thread ended up with, read through `stackSave` rather than
+    // through an exported global. Global 0 *is* the stack pointer, but this
+    // module exports no globals — only a separately patched capture does — so
+    // asking for `__global_0` here logs nothing at all, which reads as "the
+    // stack is fine" rather than as "not measured".
     if let Some(save) = instance.get_func(&mut store, "stackSave") {
         let mut sp = [Val::I32(0)];
         let reading = match save.call(&mut store, &[], &mut sp) {
@@ -277,13 +318,6 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
             .context("_emscripten_tls_init")?;
     }
 
-    // No `establishStackSpace` here, deliberately: `_emscripten_thread_init`
-    // already gives the thread its stack in this build. Doing it again from the
-    // host — reading the bounds from `struct pthread` at +52/+56, as
-    // emscripten's JS does — was measured and is much worse: those offsets do
-    // not hold for this module, the two words read pass a bounds check by
-    // accident, and installing them takes the worker pool from "1 returns, 2
-    // stop" to all five stopping on wild addresses and unaligned atomics.
     ctx.shared.scheduler.release(ctx.id);
 
     let entry = table_entry(&mut store, &instance, start_routine)?;
@@ -323,6 +357,16 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
         },
     );
 
+    // The guest's teardown runs even when the routine trapped, and that is
+    // deliberate — it was tried the other way.
+    //
+    // `_emscripten_thread_exit` frees this thread's stack and TLS through the
+    // guest allocator and unlinks it from the pthread list, so running it after
+    // a trap means running it against whatever state the trap left. Skipping it
+    // in that case looks obviously safer and is measurably worse: three rounds
+    // of four corrupt in `examples/ring_corruption.rs`, against about one in
+    // four with it. A pthread left linked is something the surviving workers
+    // trip over, and worker deaths are what the corruption tracks.
     if let Some(exit) = instance.get_func(&mut store, "_emscripten_thread_exit") {
         let _ = exit.call(&mut store, &[Val::I32(0)], &mut []);
     }

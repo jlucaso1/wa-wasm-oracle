@@ -24,15 +24,25 @@ cargo build --release             # always --release; see below
 cargo test --release -- --nocapture
 ```
 
-`fetch-wasm.py` reads `wasm.lock.json`, walks the releases it names, and refuses
-any payload whose SHA-256 does not match. Two sources, tried in order:
+`fetch-wasm.py` reads `wasm.lock.json` and refuses any payload whose SHA-256
+does not match. Three sources, tried in order:
 
+- **`static.whatsapp.net` — the capture's own origin**, one url per module,
+  recorded in the lock. WhatsApp's CDN still serves the pinned 2025-05-27 bytes,
+  all six verifying against the hashes here, so a clone with no credentials at
+  all gets the full set from where the capture was taken. The path segment after
+  `rsrc.php` is part of the address, not decoration: the same file under a
+  different one is a 403.
 - [oxidezap/whatspec](https://github.com/oxidezap/whatspec) `bundle-store` —
   public, and carries whatever set the current WhatsApp rollout serves. Four of
-  the six modules come from here.
+  the six modules are in its current set.
 - `jlucaso1/wa-wasm-oracle` `captured-modules` — private, and carries the VoIP
   engine and MP4 core, which whatspec's rolling set no longer has. Needs a
   token: `GITHUB_TOKEN`, or a `gh auth login` the script can borrow from.
+
+The release archives are the fallback for the day a capture rolls off the CDN;
+until then nothing but network access is needed. The token is offered to GitHub
+only — a token sent to the CDN would be a credential disclosed to a third party.
 
 The oracle then finds `wasm/` on its own; `WA_WASM_DIR` or `--dir` override the
 lookup, and a whatsapp-rust checkout with `docs/captured-js/wasm/` next to this
@@ -118,10 +128,25 @@ touches the real filesystem.
 | `php8T1oSIZM` | 373 KiB | **mozjpeg** — `imgoperations/wajs-mozjpeg-wasm` | instantiates clean |
 | `rogm88TRRiw` | 2.0 MiB | **WebP / media** — `webpcheck.rs`, `libwamediacommon-rs` | **runs as a CLI** |
 | `ayqr5HQtlkb` | 2.0 MiB | **MP4 utils** — check, repair, remux | **runs as a CLI** |
-| `9Nbh3eMuVjD` | 2.8 MiB | **MP4 core** — `libmp4operations-rs`, stream-type tables | loads |
+| `9Nbh3eMuVjD` | 2.8 MiB | **MP4 core** — `libmp4operations-rs`, stream-type tables | **runs as a CLI** |
 
 `rogm88TRRiw` and `ayqr5HQtlkb` kept their name section and export readable
 symbols (`ExamineH264Stream`, `ParseAACStream`, `convertFixed32BitToFloat`).
+
+`9Nbh3eMuVjD` is the odd one: a *Rust* implementation with a `clap` command
+line, next to the C++ tool suite that does the same job.
+
+```console
+$ oracle run 9Nbh3eMuVjD -f in.mp4=clip.mp4 -- mediautils mp4check in.mp4
+MP4 file consistency: OK
+
+$ oracle run 9Nbh3eMuVjD -f in.mp4=junk.bin -- mediautils mp4check in.mp4
+Error: WamediaError(239: Unknown MP4 box topology)
+exit: 1
+
+$ oracle run 9Nbh3eMuVjD -f x=clip.mp4 -- classify x       # by content, not by name
+Mimetype: Some("video/mp4"), Extension: Some("mp4"), Score: 0, Reason: 0
+```
 
 ## The VoIP engine
 
@@ -229,6 +254,17 @@ One more piece was needed: emscripten initialises the *main* thread through
 believed no thread was the main one. Nothing failed immediately — but the first
 time a worker tried to coordinate with the main thread, the main thread spun
 forever waiting for one that never identified itself.
+
+**Every guest thread runs on the main thread's stack**, and that is a known gap
+rather than an oversight. The stack pointer is a per-instance global, so a new
+instance starts from the module's initial `0x24cf60`; emscripten's worker moves
+it with `establishStackSpace`, reading bounds out of `struct pthread`. Doing the
+same here works — each worker takes its own 64 KiB region — and it costs two
+signaling tests, because the heap corruption it was meant to explain trips in a
+different run instead of stopping. Measured both ways in "Giving each thread its
+own stack works, and is still not the fix" in `VOIP_STATUS.md`; read it before
+re-trying, and note that 64 KiB against the borrowed 1 MiB is a 16× cut in
+headroom with no guard page behind it.
 
 ## Determinism
 
@@ -513,6 +549,17 @@ a memory scan, so unrelated heap bytes came back as extra log lines and two
 probes of the same input could disagree — which is exactly what stalled the
 offer investigation. `engine_log_overflowed()` reports when the ring has wrapped,
 because past that point an index from an earlier read no longer means anything.
+
+**And it refuses when it cannot be trusted.** `memory_view_is_coherent()`
+re-reads a slice of the module's own static data, sampled once its constructors
+placed it, and `engine_log()` returns nothing when that slice no longer matches.
+It was written for a fault that destroyed the whole of linear memory about one
+run in four — the host reading `env::get_random_bytes_js` as `(buf, len)` when
+the module calls it `(len, buf)`, turning a 32-byte key request into fifteen
+megabytes of PRNG written from address 32. That is fixed (see "The host was
+writing the key material itself" in `VOIP_STATUS.md`); the refusal stays,
+because an oracle that answers from the wrong memory is worse than one that
+declines to answer.
 
 **Execution caches.** Compiled modules are cached on disk by wasmtime, keyed on
 their bytes and the compiler settings. The captured modules never change, so

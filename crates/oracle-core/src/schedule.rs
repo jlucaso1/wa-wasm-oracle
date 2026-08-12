@@ -43,6 +43,16 @@ use std::time::{Duration, Instant};
 /// How long a thread waits for its turn before taking it anyway.
 const TURN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The same, while strict turns are demanded.
+///
+/// Short because under strict turns *every* crossing of the host boundary
+/// acquires, and the common case is a worker blocked in `memory.atomic.wait32`
+/// holding the turn from inside wasm where nothing can take it back. At five
+/// seconds that is a stall per crossing and a round that never finishes; at
+/// this it degrades to "mostly serialised", which is enough to attribute a
+/// write and cheap enough to reach the write in the first place.
+const STRICT_TIMEOUT: Duration = Duration::from_millis(25);
+
 /// Serialises guest execution across threads.
 #[derive(Debug, Default)]
 pub struct Scheduler {
@@ -55,6 +65,9 @@ pub struct Scheduler {
     /// Times a thread gave up waiting and ran anyway.
     forced: AtomicU64,
     enabled: std::sync::atomic::AtomicBool,
+    /// Whether the turn must be held across every guest-execution window rather
+    /// than only around a thread's routine. See `STRICT_TIMEOUT`.
+    strict: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +81,15 @@ impl Scheduler {
     /// nothing, and the cost only makes sense once threads actually run.
     pub fn enable(&self) {
         self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// Demands one guest thread at a time. See `Runtime::demand_strict_turns`.
+    pub fn demand_strict(&self) {
+        self.strict.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_strict(&self) -> bool {
+        self.strict.load(Ordering::SeqCst)
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -89,7 +111,12 @@ impl Scheduler {
             return;
         }
 
-        let deadline = Instant::now() + TURN_TIMEOUT;
+        let deadline = Instant::now()
+            + if self.is_strict() {
+                STRICT_TIMEOUT
+            } else {
+                TURN_TIMEOUT
+            };
         self.waiting.fetch_add(1, Ordering::SeqCst);
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());

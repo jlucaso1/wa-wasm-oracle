@@ -97,9 +97,216 @@ where
         }
 
         caller.data().shared.scheduler.yield_point(thread);
+        // Also checks the memory watch; see `sync_memory`.
         sync_memory(&mut caller);
         handler(&mut caller, params, results)
     })
+}
+
+/// Installs the memory watch on a store, so every crossing of the host boundary
+/// checks it.
+///
+/// A `call_hook` rather than a check inside `host_func`, and the difference is
+/// the whole reason this works. Host functions arrive by three routes —
+/// `host_func`, the stubs, and the forty-odd `Linker::func_wrap` definitions in
+/// `emscripten.rs` — and the hottest call a guest worker makes, the clock, takes
+/// the third and touches neither of the first two. A watch checked only in
+/// `host_func` stayed silent through a round that destroyed ten megabytes of
+/// guest memory, and silence reads as "nothing wrote there" when it means
+/// "nothing looked". This hook is the one place the VM guarantees every host
+/// call passes through, however the function was defined.
+///
+/// Checking **both** directions is what lets it name a culprit rather than a
+/// witness: a span that was intact when a thread entered wasm and is broken
+/// when it comes back was broken by that thread's own guest code. Checking only
+/// on the way in reports whoever happened to make the next host call — the
+/// first catch that way was a media worker asleep in `pj_thread_sleep`, which
+/// had written nothing.
+///
+/// That argument needs one guest thread at a time, which is *not* how this host
+/// normally runs — see `Runtime::demand_strict_turns`, which an investigator
+/// has to switch on *before* the operation under suspicion. Switching it on
+/// when the watch breaks was tried and cannot work: attribution catches the
+/// transition from intact to broken, and by the time anything has noticed, the
+/// transition is over. Every sighting after it reads "already broken before
+/// this thread ran", correctly and uselessly.
+pub fn install_memory_watch(store: &mut Store<HostState>) {
+    store.call_hook(|mut context, hook| {
+        let intact = context.data().watch_intact();
+        let strict = context.data().shared.strict_turns();
+        let thread = context.data().thread_id;
+        if hook.exiting_host() {
+            if strict {
+                context.data().shared.scheduler.acquire(thread);
+            }
+            context.data().shared.entered_wasm();
+            // Only worth recording under strict turns; see the field's docs.
+            context
+                .data()
+                .watch_intact_entering_wasm
+                .set(if strict { intact } else { None });
+        } else {
+            context.data().shared.left_wasm();
+            note_growth(&mut context);
+            if intact == Some(false) {
+                let entry = context.data().watch_intact_entering_wasm.get();
+                report_broken_watch(&mut context, entry == Some(true), entry.is_some());
+            }
+            if strict {
+                context.data().shared.scheduler.release(thread);
+            }
+        }
+        Ok(())
+    });
+}
+
+/// Records a change in guest memory size, with the guest stack behind it.
+///
+/// Cheap enough for every crossing: one atomic swap unless the size actually
+/// moved. See `SharedHost::growths` for why the size is worth this much
+/// attention.
+fn note_growth(context: &mut wasmtime::StoreContextMut<'_, HostState>) {
+    let Some(size) = context
+        .data()
+        .memory
+        .as_ref()
+        .map(|memory| memory.data().len())
+    else {
+        return;
+    };
+    let Some(previous) = context.data().shared.note_memory_size(size) else {
+        return;
+    };
+
+    let thread = context.data().thread_id;
+    let frames: Vec<String> = wasmtime::WasmBacktrace::capture(&*context)
+        .frames()
+        .iter()
+        .map(|frame| match frame.func_name() {
+            Some(name) => format!("{name} (f{})", frame.func_index()),
+            None => format!("f{}", frame.func_index()),
+        })
+        .collect();
+
+    context.data().shared.record_growth(format!(
+        "{previous:#x} -> {size:#x} (+{:#x}) on thread {thread}: {}",
+        size - previous,
+        if frames.is_empty() {
+            "<no guest frames>".to_owned()
+        } else {
+            frames.join(" <- ")
+        }
+    ));
+}
+
+/// Names the moment a watched span of guest memory stopped holding what it did.
+///
+/// The interesting part is the backtrace. Entry to host code happens *inside*
+/// guest execution, so capturing here says which guest functions were on the
+/// stack when the damage first became visible — the difference between "memory
+/// was destroyed somewhere in `startVoipCall`" and a call chain to read.
+///
+/// Reported through the host log rather than returned as a trap: this is a
+/// diagnostic about a fault the host did not cause, and failing the call would
+/// replace the symptom under investigation with a different one.
+fn report_broken_watch(
+    context: &mut wasmtime::StoreContextMut<'_, HostState>,
+    wrote_it: bool,
+    sound: bool,
+) {
+    let Some(watch) = context.data().shared.watch.get() else {
+        return;
+    };
+    watch
+        .broken
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let thread = context.data().thread_id;
+    {
+        // One sighting per thread. Taken before the expensive part so that a
+        // thread already recorded pays nothing but a lock.
+        let sightings = watch.sightings.lock().unwrap_or_else(|e| e.into_inner());
+        // Keyed on the thread *and* on whether the reading is attributable: a
+        // thread that reported before strict turns began must be allowed to
+        // report again once its answer means something.
+        if sightings.len() >= crate::shared::MAX_SIGHTINGS
+            || sightings
+                .iter()
+                .any(|(id, was_sound, _)| *id == thread && *was_sound == sound)
+        {
+            return;
+        }
+    }
+    let at = watch.at;
+    let frames: Vec<String> = wasmtime::WasmBacktrace::capture(&*context)
+        .frames()
+        .iter()
+        .map(|frame| match frame.func_name() {
+            Some(name) => format!("{name} (f{})", frame.func_index()),
+            None => format!("f{}", frame.func_index()),
+        })
+        .collect();
+
+    // How much of memory has gone by the time anyone notices. A healthy image
+    // is about 83% zero bytes; the wreck is about 3%. Sampling that here says
+    // whether the damage arrived as one event or was still spreading — the
+    // difference between looking for a single wild write and looking for a
+    // loop.
+    let (size, zeros) = sampled_zeroes(context.data());
+
+    let report = format!(
+        "watch {at:#x} broken, thread {thread} {}, \
+         memory {size:#x} and {zeros}% zero bytes, guest stack: {}",
+        match (wrote_it, sound) {
+            (true, true) => "WROTE IT",
+            (true, false) => "wrote it, unattributable (threads were still concurrent)",
+            (false, _) => "only saw it (already broken before this thread ran)",
+        },
+        if frames.is_empty() {
+            "<none>".to_owned()
+        } else {
+            frames.join(" <- ")
+        }
+    );
+    watch
+        .sightings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((thread, sound, report.clone()));
+    context.data().shared.log(thread, report);
+}
+
+/// Memory size, and the percentage of zero bytes in a strided sample of it.
+///
+/// Strided rather than exhaustive because this runs while the guest is stopped
+/// mid-call: reading seventeen megabytes here would change what is being
+/// measured. Every 64th byte is plenty to tell 83% from 3%.
+#[allow(unsafe_code)]
+fn sampled_zeroes(state: &HostState) -> (usize, u32) {
+    const STRIDE: usize = 64;
+
+    let Some(memory) = state.memory.as_ref() else {
+        return (0, 0);
+    };
+    let data = memory.data();
+    let mut seen = 0u64;
+    let mut zero = 0u64;
+    let mut at = 0;
+    while at < data.len() {
+        // SAFETY: as in `HostState::read` — one byte read through the cell, no
+        // reference into shared memory formed, index bounded by the loop.
+        if unsafe { *data[at].get() } == 0 {
+            zero += 1;
+        }
+        seen += 1;
+        at += STRIDE;
+    }
+    let percent = if seen == 0 {
+        0
+    } else {
+        u32::try_from(zero * 100 / seen).unwrap_or(0)
+    };
+    (data.len(), percent)
 }
 
 pub(crate) fn build_engine() -> Result<Engine> {

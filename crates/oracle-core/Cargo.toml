@@ -17,7 +17,6 @@ workspace = true
 
 [dev-dependencies]
 base64 = "0.23.0"
-flate2 = "1.1.9"
 # Used only to build wire-format stanzas for the signaling tests: the oracle is
 # fed the same bytes whatsapp-rust would emit. `simd` needs nightly, and this is
 # not a hot path.

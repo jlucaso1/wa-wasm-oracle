@@ -826,12 +826,58 @@ through another.
 **And `l3` is a stack address.** Probing it the same way — store `l3 + 1`, so
 that 0 still means "did not run" — reads back `0x24bed0`. The initial stack
 pointer is `0x24cf60` and `start_call_md`'s frame is 4176 bytes, so `l3` points
-inside that frame: the participant jid is a **local struct the bridge builds on
-its own stack**, and its first field — the user jid — is never filled.
+inside that frame.
 
 That is also the address this file has been calling "the participant array
 `make_and_cache_offer` reads", from much earlier and by a different route. The
-two agree.
+two agree — and **the array is what it is**, not a participant jid built on the
+stack. Reading `start_call_md`'s tail settles it, `oracle abi --index 1085
+--body 700`:
+
+    frame+268 .. +4124   memset 0, 3856 bytes    <- the call params blob
+    frame+268            strncpy(call_id, <= 63)
+    frame+264 = 1                                <- participant count
+    frame+0 .. +256      memset 0, 256 bytes     <- 64 participant slots
+    frame+0   = l8                               <- participants[0]
+    frame+260 = frame                            <- params->participants
+    f99(682, frame + 260)                        <- args = frame+260, not frame
+
+So `args + 0` is `params->participants`, `args + 4` is the count, and `l3` is
+the array — which is why it is a stack address and why `*(l3 + 0)` is
+`participants[0]`. `wa_call_start_internal`'s own entry guard agrees: it demands
+`1 <= arg4 <= 63`, so `arg3`/`arg4` are an array and a count, and `local 3` is
+never reassigned in its 2,842 instructions.
+
+**Which makes the null harder to explain, not easier.** Three static facts, each
+read out of the bytes rather than inferred:
+
+* `start_call_md` never builds the args struct when `create_participant_jid`
+  returns null. The two instructions after the call are `local.get 8; br_if 6`
+  and `br 8`, and `br 8` lands on the epilogue — it restores the stack and
+  returns an uninitialised `l11`, so a failed participant jid produces no
+  `make_and_cache_offer` and no `70008` at all.
+* `wa_call_participant_jid_create_with_params` (`f10293`, table slot 679)
+  **refuses** a null `params->user_jid`: the entry guard is
+  `params && pool && out && *(params + 0)`, and failing it asserts
+  `wa_call_participant_jid.cc:30` and returns `70004`. Its first act on success
+  is `*(obj + 0) = *(params + 0)` — which is precisely what
+  `get_user_jid` reads back.
+* `create_participant_jid` checks that return and asserts
+  `WaCallWebCallingBridge.cpp:101` if it is non-zero.
+
+A participant jid that exists therefore *has* a user jid, and a participant jid
+that does not exist never reaches the offer. Both cannot be true alongside
+`participants[0] == 0` at `offer.cc:485`, so one of the two is measuring
+something else — and the probe is the newer, less certain of the two.
+
+The obvious suspect is that `participants[0]` is written correctly and then
+overwritten: it lives at `0x24bed0`, on the main thread's stack, which every
+guest thread also runs on. That is exactly the shape of "stored non-null, read
+back zero" — but it does not survive the next section. Giving the workers their
+own stacks does not make the offer path behave differently; it makes
+`startVoipCall` trap earlier, on a heap pointer, deterministically. Whatever
+zeroes this word has to be something that still happens when the workers are
+nowhere near that region.
 
 The probe only reports on runs that reach the site; the ones that stop earlier
 read 0 and say "did not run", which is exactly what the `+ 1` encoding is for.
@@ -1061,6 +1107,204 @@ too, and may need calling on the thread's instance.
 Exports worth knowing: `emscripten_stack_set_limits`, `..._get_base`,
 `..._get_end`, `..._get_current`, `..._get_free`, `emscripten_stack_init`,
 `stackSave`, `stackRestore`, `stackAlloc`, `pthread_self`.
+
+### Giving each thread its own stack works, and is still not the fix
+
+Those exports answer the question they were listed for. `emscripten_stack_get_
+base` and `..._get_end` report **`0x24cf60` and `0x14cf60`** — the main thread's
+stack is a 1 MiB region, and it is the region every guest thread starts from.
+
+Running emscripten's `establishStackSpace` on each worker — reading `+52`/`+56`
+out of the thread's own `struct pthread`, exactly as the web build does — works.
+The workers land where the guest's `pthread_create` put them:
+
+```
+thread 1 stack 0x822350..0x832350 (65536 bytes)
+thread 2 stack 0x882350..0x892350 (65536 bytes)
+thread 3 stack 0x894690..0x8a4690 (65536 bytes)
+```
+
+**The offsets hold.** This file recorded "those offsets do not hold for this
+module"; they do. What the earlier attempt hit is the race the spin-wait in
+`threads.rs` now closes — the creating thread fills `+52`/`+56` *after* the new
+thread is already running, so reading them at the top of the thread gives zeros,
+and zero bounds are what put the workers on wild addresses.
+
+**And it is still not an improvement, measured both ways.** It is not in
+`threads.rs`, and the reason is this pair of results rather than a preference:
+
+| | shared stack | own stack |
+| --- | --- | --- |
+| `profiler_flag.rs` — `startVoipCall` | traps in `f763` | returns `70004` |
+| `profiler_flag.rs` — workers stopped | 1 | 0 |
+| `profiler_flag.rs` — main SP afterwards | `0x241830` | `0x24cf60` |
+| `signaling --ignored` | **23 passed** | **21 passed, 2 failed** |
+
+The minimal probe says the change fixes something; the full suite says it breaks
+two things. The tie-break is *what* breaks — and it is **the same trap in both
+columns, only in a different run**:
+
+    f1139   startVoipCall's embind wrapper
+    f763    a container destructor
+    f13513
+    f13089  free, refusing the pointer it was handed
+
+Shared stack, that is `profiler_flag.rs`. Own stacks, that is
+`the_engine_starts_an_outgoing_call`, four attempts out of four. The second
+failure is offer-then-call filling the log ring with 880 unstructured lines.
+
+**So the heap corruption behind that trap is not the shared stack.** Moving the
+stacks moves which run trips it, and nothing more. Anything built on "the
+workers were writing over each other" has to survive that.
+
+What the change does buy, and what a next attempt should keep: the workers get
+64 KiB each where they had been borrowing 1 MiB. That is a 16× cut in headroom,
+wasm has no guard page, and the engine's own frames are not small —
+`start_call_md` alone takes 4,176 bytes plus a 3,856-byte `memory.fill`. It is
+the first thing to account for before re-trying this.
+
+### The host was writing the key material itself
+
+**`env::get_random_bytes_js` takes `(len, buf)`. This host had it as
+`(buf, len)`.** That one transposition is the whole of the ring corruption, the
+`free`-refusing-a-pointer trap, and every "the host and the guest read different
+memory" theory in the history of this file.
+
+The module's only caller of it is the crypto callback in function-table slot 298
+that `generate_raw_e2e_keys` (`wa_call_participant_crypto.cc`) dispatches
+through, and its bytecode leaves nothing to interpret:
+
+```
+f649:   i32.const 32      ; the length — this callback rejects any other
+        local.get 0       ; the destination
+        call 8            ; env::get_random_bytes_js
+```
+
+Read with the arguments swapped, a request for 32 bytes at `0xf00000` becomes
+**fifteen megabytes of the host's own PRNG written from address 32**. Every
+symptom follows from that and nothing else is needed to explain any of them:
+
+| symptom | what it was |
+| --- | --- |
+| high-entropy bytes that "look like key material" | they *are* key material: the host's PRNG, on the key-generation path |
+| the whole image changed, one span, 83% zeroes down to 3% | one write covering almost all of memory |
+| the ring destroyed with `getLogRingBufferOverflowCount` zero | the ring was simply inside the range |
+| the guest's own `malloc` trapping afterwards | its heap was inside the range too |
+| the 64 KiB `0xA5` guard block absent rather than moved | overwritten, like everything else |
+| `free` refusing a pointer inside `startVoipCall` | same write, caught where it traps instead of where it reads |
+
+**And it explains the exact discriminator**, which was the sharpest clue on the
+table and was pointing the right way all along. `HostState::write` refuses an
+out-of-bounds range, so the bogus write only lands when `32 + destination` still
+fits inside linear memory. A round that grew to `0x10e0000` had room and was
+destroyed; a round that stopped at `0xf10000` did not and survived untouched.
+Two values, not a distribution, because it was not a correlation — the heap size
+*decided* whether the write was refused.
+
+Measured: **8 corrupt rounds of 8 became 8 clean rounds of 8**, and a round
+reaching `0x10e0000` — previously an exact predictor of corruption — now
+completes healthy with 61 structured log lines.
+
+`settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call` asserts
+coherence now rather than tolerating its absence.
+
+#### How it hid for so long
+
+Worth recording, because every one of these was a reasonable-looking step in the
+wrong direction:
+
+* **The declared type does not disambiguate.** `(i32, i32)` is what the module
+  says, and `getentropy(buf, len)` sits directly above it in `emscripten.rs`.
+  This is not a standard emscripten import — it is WhatsApp's own — so the
+  convention that made the guess feel safe never applied.
+* **The host's randomness had been "excluded by measurement".** Twice. The first
+  pass instrumented writes of 64 KiB or more and found only the probe's own
+  guard fills — but that instrumentation was watching `HostState::write` call
+  sites it knew about. The second pass counted `fill_random` calls through
+  `calls_to`, which reads the argument-carrying trace, and that trace stops at
+  8192 entries while a round makes fifty million host calls. It answered "never
+  called" about a function that was called. The counts in `hot_calls` are
+  unbounded and are what such a question needs.
+* **`emscripten_stack_get_base` was treated as evidence.** Its body is
+  `global.get 8; end` — a wasm global, which lives in the store, not in memory.
+  It answers identically on a wiped module and a healthy one. Everything built
+  on "the guest is fine, so the host must be looking elsewhere" was built on
+  that.
+
+Two real defects were found on the way and are documented below rather than
+fixed, because neither turned out to cause this and both remain true: guest
+threads run concurrently when the design says they must not, and they all start
+from the same stack pointer.
+
+### Guest threads run concurrently, on one stack
+
+Found while chasing the corruption above, unrelated to it, and true regardless.
+
+**Up to six guest threads execute at the same time.** `max_threads_in_wasm()`
+counts it, bracketing every crossing of the host boundary in the store's
+`call_hook`. It must be 1. It is 5 or 6 in every round, healthy and corrupt
+alike.
+
+`schedule.rs` cannot prevent that as written. A thread acquires the turn once,
+around its whole routine, and `yield_point` hands it on only while `waiting > 0`
+— that is, only while some other thread is blocked in its own first `acquire`.
+Once every worker has forced its way past `TURN_TIMEOUT`, nothing is waiting
+again, so nothing ever yields. The `func_wrap` gap makes it worse: a PJSIP
+worker sitting in `pj_thread_sleep` reaches `emscripten_get_now` and nothing
+else, and that import passes through neither `host_func` nor `yield_point`.
+
+**And every guest thread starts from the same stack pointer.** It is a
+per-instance wasm global, every instance is initialised from the same module,
+and `__emscripten_thread_init` sets the TLS globals and nothing else. So each
+thread begins at `0x24cf60`, the main thread's own region.
+
+Neither is fixed, and the measurements say why:
+
+* Serialising properly — holding the turn across exactly the guest-execution
+  window, acquired and released in the `call_hook` — is correct and unusable. A
+  two-minute round had not finished in ten, and cutting the turn timeout from
+  five seconds to 25 ms did not help: under strict turns every crossing takes
+  the scheduler lock, and a worker polling the clock crosses tens of millions of
+  times per round. `Runtime::demand_strict_turns` exposes it for an
+  investigator who wants attribution and can wait.
+* Giving each worker its own stack makes things strictly worse, three times over
+  — 64 KiB from the guest's own `pthread_create` traps `startVoipCall` four
+  attempts of four, 4 MiB "changes nothing", and 1 MiB installed through the
+  module's own exports gave 8 corrupt rounds of 8 against a baseline of one in
+  four. That contradiction is still unexplained; it is now a curiosity rather
+  than a lead, since the corruption it was competing to explain has a cause.
+
+Do not write code whose safety argument is "the scheduler holds all but one
+thread outside guest code". `HostState::read`'s SAFETY note is the one place
+that still says it.
+
+### The profiler flag is 5,640 bytes below the main stack
+
+`scripts/neutralize_thread_profiler.py` says the corruption of `0x14B958` is
+"still unexplained". Here is the geometry it was missing: **`emscripten_stack_
+get_end` is `0x14cf60`**, and `0x14B958` is `0x1608` bytes below it. Static data
+begins where the stack region ends, and the profiler flag is the first
+interesting byte under it — so a stack running past its own low bound writes
+exactly there, and seven threads sharing one 1 MiB region is not a rare way to
+do that.
+
+That is geometry, not proof, and `examples/profiler_flag.rs` is what would
+carry it further: it reads the byte at instantiation, after the constructors,
+after `initVoipStack` and after `startVoipCall`, with the engine log ring
+attached at level 9 and the soft-assert gate open. **On the current host it
+reads `0x00` at every one of those points, with no worker trapping.** So the
+run that needs the patched capture is not this one, and the script's own
+"27 lines and eleven traps" baseline is not reproducible here.
+
+`examples/outgoing_call.rs` still ends with corrupted memory, and this is where
+that lives now. It is a probe script written against a *patched* capture — it
+reports "probe: did not run (unpatched capture?)" against the original — and it
+enables machinery a real client does not. Both of its recent runs came back at
+~54 engine-log lines against the ~200 a healthy run reaches, so by the health
+rule further down neither is evidence about anything. What it does establish is
+that something it does corrupts memory on its own, because `profiler_flag.rs`
+reproduces its log level *and* its assert gate with none of that.
+`startJsWorkerThread` and `initSctpRingBuffer` are what is left between them.
 
 Two theories died getting here, both of them mine. The JID-shape mismatch is
 gone — the strings are identical, and `pj_strcmp` reads its length as an i64 at
